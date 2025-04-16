@@ -310,17 +310,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Answer handler with completely independent timer management
+    Bullet-proof answer handler with priority response handling
     """
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
     user_answer = update.message.text.strip()
     chat_id = update.message.chat_id
     
-    # Log the answer attempt with clear visibility
+    # Log the answer attempt with high visibility
     logging.info(f"⚡⚡⚡ ANSWER ATTEMPT from user {user_id}: '{user_answer}'")
     
-    # Check if user has a session with a question
+    # 1. Send immediate acknowledgment to user
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏳ Проверяю ваш ответ..."
+        )
+        logging.info(f"Sent acknowledgment message to user {user_id}")
+    except Exception as e:
+        logging.error(f"Failed to send acknowledgment: {e}")
+    
+    # 2. Check if user has a session with a question
     session = user_sessions.get(user_id)
     if not session or "q" not in session:
         await context.bot.send_message(
@@ -329,17 +339,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # First thing: Send immediate acknowledgment to user
-    try:
-        ack_message = await context.bot.send_message(
-            chat_id=chat_id,
-            text="⏳ Проверяю ваш ответ..."
-        )
-        logging.info(f"Sent acknowledgment message to user {user_id}")
-    except Exception as e:
-        logging.error(f"Failed to send acknowledgment: {e}")
-    
-    # CRITICAL: Stop timer immediately before any answer processing
+    # 3. CRITICAL: Stop timer immediately before any answer processing
     try:
         if session.get("timer_task") and not session.get("timer_task").done():
             session["timer_task"].cancel()
@@ -347,7 +347,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Failed to cancel timer: {e}")
     
-    # Get the correct answer from the question
+    # 4. Get the correct answer from the question
     q = session["q"]
     correct_answer = q.get("answer", "")
     comment = q.get("comment") or "Без комментария."
@@ -360,34 +360,15 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Check if answer is correct using standard checks
+    # 5. Check if answer is correct
     logging.info(f"Checking answer: '{user_answer}' against correct: '{correct_answer}'")
     
     # Use our multi-strategy matching function
     is_correct = check_answer(user_answer, correct_answer)
     
-    # Handle special cases for very common CHGK questions
-    if not is_correct:
-        # Check for special Chukovsky question about engineer/teacher
-        if "чуковского" in q.get("question", "").lower() and "От 2-х до 5-ти" in q.get("question", ""):
-            if ("дядей" in user_answer.lower() and "инженером" in user_answer.lower() and 
-                "тетей" in user_answer.lower() and "учительницей" in user_answer.lower()):
-                is_correct = True
-                logging.info(f"SPECIAL MATCH: Chukovsky question")
-        
-        # Check for шпоры vs стремена edge case
-        elif "шпоры" in user_answer.lower() and "стремена" in correct_answer.lower():
-            is_correct = True
-            logging.info(f"SPECIAL MATCH: шпоры/стремена")
-        
-        # Check for сладкий уксус case
-        elif "сладкий уксус" in user_answer.lower():
-            is_correct = True
-            logging.info(f"SPECIAL MATCH: сладкий уксус")
-    
-    # Process the result based on correctness
+    # 6. Process the result based on correctness
     if is_correct:
-        # Mark as correctly answered in user session - IMPORTANT to set both flags
+        # Mark as correctly answered in user session
         user_sessions[user_id]["answered"] = True
         user_sessions[user_id]["correct_answer"] = True
         
@@ -405,22 +386,32 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         
         try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}",
+            # CRITICAL FIX: Use a different approach to send the message to ensure it works
+            await update.message.reply_text(
+                f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             logging.info(f"Sent correct answer confirmation to user {user_id}")
         except Exception as e:
-            logging.error(f"Failed to send correct answer confirmation: {e}")
-            # Try with simpler message
+            logging.error(f"Failed to send via reply_text: {e}")
             try:
+                # Fallback method
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="✅ Правильно!"
+                    text=f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-            except Exception:
-                pass
+                logging.info(f"Sent correct answer via fallback method to user {user_id}")
+            except Exception as e2:
+                logging.error(f"Also failed with fallback method: {e2}")
+                # Last resort method
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ Правильно!"
+                    )
+                except Exception:
+                    logging.error("Failed all attempts to send correct message")
     else:
         # Check if time already expired (from timer)
         if session.get("answered", False) and not session.get("correct_answer", False):
@@ -428,25 +419,36 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
             
             try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
+                await update.message.reply_text(
                     text="❌ Неверно. Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
                 logging.info(f"Sent 'incorrect + time expired' message to user {user_id}")
             except Exception as e:
-                logging.error(f"Failed to send 'incorrect + time expired' message: {e}")
+                # Fallback for incorrect answers
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ Неверно. Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                except Exception as e2:
+                    logging.error(f"Failed all attempts to send 'time expired' message: {e2}")
         else:
             # Timer hasn't expired, allow another attempt
-            # Important: Don't modify the answered flag here to allow more attempts
             try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
+                await update.message.reply_text(
                     text="❌ Неверно, попробуйте еще раз!"
                 )
                 logging.info(f"Sent incorrect answer message to user {user_id}")
             except Exception as e:
-                logging.error(f"Failed to send incorrect message: {e}")
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ Неверно, попробуйте еще раз!"
+                    )
+                except Exception as e2:
+                    logging.error(f"Failed all attempts to send 'incorrect' message: {e2}")
 
 def check_answer(user_answer, correct_answer):
     """
