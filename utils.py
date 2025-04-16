@@ -48,10 +48,12 @@ async def start_timer(chat_id, context, user_id, q, mode):
         logging.warning(f"[timer] Error: no session for user {user_id}")
         return
 
+    # Store the current task so it can be cancelled if needed
     current_task = asyncio.current_task()
     user_sessions[user_id]["timer_task"] = current_task
 
     try:
+        # Calculate reading time based on question length and images
         question_text = q.get("question", "")
         words_count = len(question_text.split())
         reading_time = min(20, max(5, (words_count // 15) * 5))
@@ -59,41 +61,69 @@ async def start_timer(chat_id, context, user_id, q, mode):
         if q.get("image_urls"):
             reading_time += 5 * len(q.get("image_urls", []))
 
+        # Check if the user has already answered before sending reading time message
         session = user_sessions.get(user_id, {})
         if session.get("answered") or session.get("correct_answer"):
+            logging.info(f"[timer] User {user_id} already answered, skipping timer")
             return
 
+        # Send reading time message
         if reading_time > 5 and mode != "blind":
             await context.bot.send_message(
                 chat_id, 
                 f"⏳ У вас есть {reading_time} секунд на чтение вопроса."
             )
 
+        # Wait for reading time
         await asyncio.sleep(reading_time)
 
+        # Check again if user answered during reading time
         session = user_sessions.get(user_id, {})
-        if session.get("answered") or session.get("correct_answer"):
+        if not session or session.get("answered") or session.get("correct_answer"):
+            logging.info(f"[timer] User {user_id} answered during reading time")
             return
 
+        # Send timer start message
         if mode != "blind":
             await context.bot.send_message(
                 chat_id, 
                 f"⏱️ Отсчет времени начался! ({config['total_time']} секунд)"
             )
 
-        for _ in range(config["total_time"]):
+        # Wait for answering time, checking each second if user has answered
+        for i in range(config['total_time']):
             await asyncio.sleep(1)
             session = user_sessions.get(user_id, {})
-            if session.get("answered") or session.get("correct_answer"):
+            
+            # Skip if the session was removed or user answered
+            if not session or session.get("answered") or session.get("correct_answer"):
+                logging.info(f"[timer] User {user_id} answered or session removed")
                 return
+                
+            # Send hint at halfway point if enabled for this mode
+            if config["show_hint"] and i == config["hint_time"] and ENABLE_HINTS:
+                answer = q.get("answer", "")
+                hint = format_hint(answer)
+                
+                # Check once more if user answered before sending hint
+                session = user_sessions.get(user_id, {})
+                if not session or session.get("answered") or session.get("correct_answer"):
+                    return
+                    
+                await context.bot.send_message(chat_id, f"💡 Подсказка: {hint}")
 
+        # Final check before time's up message
         session = user_sessions.get(user_id, {})
-        if session.get("answered") or session.get("correct_answer"):
+        if not session or session.get("answered") or session.get("correct_answer"):
+            logging.info(f"[timer] User {user_id} answered at the last moment")
             return
 
+        # Mark as answered to prevent duplicate answers
         if user_id in user_sessions:
             user_sessions[user_id]["answered"] = True
+            logging.info(f"[timer] Time's up for user {user_id}, marking as answered")
 
+        # Send time's up message with answer reveal button
         keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
         await context.bot.send_message(
             chat_id, 

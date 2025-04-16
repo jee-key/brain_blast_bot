@@ -263,7 +263,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
-    user_answer = update.message.text.strip().lower()
+    user_answer = update.message.text.strip()
     logging.info(f"Processing answer from user {user_id} ({name}): '{user_answer}'")
     
     session = user_sessions.get(user_id)
@@ -278,53 +278,115 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Твой ответ уже принят, дождитесь следующего вопроса.")
         return
 
-    # Mark the question as answered immediately
+    # Mark the question as answered immediately 
     user_sessions[user_id]["answered"] = True
-
-    # Send acknowledgment message immediately
-    await update.message.reply_text("⏳ Твой ответ принят и обрабатывается...")
+    
+    # Cancel the timer immediately to prevent "Time's up!" message
+    if session.get("timer_task") and not session.get("timer_task").done():
+        logging.info(f"Canceling timer for user {user_id}")
+        session["timer_task"].cancel()
+        session["timer_task"] = None
 
     # Process the answer
     try:
         correct_answer = session["q"]["answer"]
         logging.info(f"Correct answer: '{correct_answer}'")
         
-        clean_correct = normalize_answer(correct_answer)
-        clean_user = normalize_answer(user_answer)
-        logging.info(f"Normalized - User: '{clean_user}', Correct: '{clean_correct}'")
-        
-        correct_keywords = set(clean_correct.split())
-        user_keywords = set(clean_user.split())
+        # Special handling for multi-part (duplex) questions
+        is_duplex = "1." in correct_answer and "2." in correct_answer
         is_correct = False
-
-        if clean_user == clean_correct:
-            is_correct = True
-            logging.info("Match: Exact after normalization")
-        elif clean_user in clean_correct or clean_correct in clean_user:
-            is_correct = True
-            logging.info("Match: One contains the other")
-        elif user_answer.strip().lower() == correct_answer.strip().lower():
-            is_correct = True
-            logging.info("Match: Raw lowercased answers match")
-        elif len(correct_keywords) > 1 and len(user_keywords) > 0:
-            common_words = correct_keywords.intersection(user_keywords)
-            match_percentage = len(common_words) / len(correct_keywords)
-            logging.info(f"Keywords match: {match_percentage:.2f} ({len(common_words)}/{len(correct_keywords)})")
-            if match_percentage >= 0.7:
+        
+        # Store original answers for output
+        original_user_answer = user_answer
+        original_correct_answer = correct_answer
+        
+        # Check if this is a duplex/multi-part question
+        if is_duplex:
+            logging.info("Detected multi-part question (duplex)")
+            
+            # Simple direct match for multi-part questions
+            if user_answer.lower() == correct_answer.lower():
                 is_correct = True
-
-        if not is_correct and len(clean_correct) < 15:
-            comment = session["q"].get("comment", "").lower()
-            if comment and clean_user in comment:
-                acceptance_indicators = [
-                    "также принимается", "засчитывать", "принимать", 
-                    "зачет", "зачёт", "зачитывать", "эквивалент"
-                ]
-                for indicator in acceptance_indicators:
-                    if indicator in comment:
+                logging.info("Exact match for multi-part question")
+            else:
+                # For duplex questions, normalize both parts separately and compare
+                correct_parts = []
+                user_parts = []
+                
+                # Split answer into parts if formatted with numbers (1. ... 2. ...)
+                if "1." in correct_answer and "2." in correct_answer:
+                    correct_text = correct_answer.lower()
+                    # Extract parts by splitting at number markers
+                    correct_parts = re.split(r'\d\.', correct_text)
+                    # Remove empty first element if split resulted in it
+                    if correct_parts and not correct_parts[0].strip():
+                        correct_parts = correct_parts[1:]
+                    
+                if "1." in user_answer and "2." in user_answer:
+                    user_text = user_answer.lower()
+                    # Extract parts by splitting at number markers
+                    user_parts = re.split(r'\d\.', user_text)
+                    # Remove empty first element if split resulted in it
+                    if user_parts and not user_parts[0].strip():
+                        user_parts = user_parts[1:]
+                
+                # If we have same number of parts, check each part separately
+                if len(correct_parts) == len(user_parts) and len(correct_parts) > 0:
+                    part_matches = 0
+                    for i in range(len(correct_parts)):
+                        clean_correct = normalize_answer(correct_parts[i])
+                        clean_user = normalize_answer(user_parts[i])
+                        
+                        logging.info(f"Part {i+1} - Normalized - User: '{clean_user}', Correct: '{clean_correct}'")
+                        
+                        # Check for match in this part
+                        if (clean_user == clean_correct or 
+                            clean_user in clean_correct or 
+                            clean_correct in clean_user):
+                            part_matches += 1
+                            logging.info(f"Part {i+1} matches")
+                    
+                    # If all parts match, the answer is correct
+                    if part_matches == len(correct_parts):
                         is_correct = True
-                        logging.info(f"Alternative answer accepted based on comment containing '{indicator}'")
-                        break
+                        logging.info(f"All {part_matches} parts match for multi-part question")
+        else:
+            # Regular single-part question processing
+            clean_correct = normalize_answer(correct_answer)
+            clean_user = normalize_answer(user_answer)
+            logging.info(f"Normalized - User: '{clean_user}', Correct: '{clean_correct}'")
+            
+            correct_keywords = set(clean_correct.split())
+            user_keywords = set(clean_user.split())
+
+            if clean_user == clean_correct:
+                is_correct = True
+                logging.info("Match: Exact after normalization")
+            elif clean_user in clean_correct or clean_correct in clean_user:
+                is_correct = True
+                logging.info("Match: One contains the other")
+            elif user_answer.strip().lower() == correct_answer.strip().lower():
+                is_correct = True
+                logging.info("Match: Raw lowercased answers match")
+            elif len(correct_keywords) > 1 and len(user_keywords) > 0:
+                common_words = correct_keywords.intersection(user_keywords)
+                match_percentage = len(common_words) / len(correct_keywords)
+                logging.info(f"Keywords match: {match_percentage:.2f} ({len(common_words)}/{len(correct_keywords)})")
+                if match_percentage >= 0.7:
+                    is_correct = True
+
+            if not is_correct and len(clean_correct) < 15:
+                comment = session["q"].get("comment", "").lower()
+                if comment and clean_user in comment:
+                    acceptance_indicators = [
+                        "также принимается", "засчитывать", "принимать", 
+                        "зачет", "зачёт", "зачитывать", "эквивалент"
+                    ]
+                    for indicator in acceptance_indicators:
+                        if indicator in comment:
+                            is_correct = True
+                            logging.info(f"Alternative answer accepted based on comment containing '{indicator}'")
+                            break
 
         # Provide feedback to the user
         if is_correct:
@@ -334,22 +396,20 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             comment = session["q"].get("comment") or "Без комментария."
             await update.message.reply_text(
                 f"✅ Правильно! Вы ответили верно.\n\n"
-                f"📝 Ответ: {session['q']['answer']}\n"
+                f"📝 Ответ: {original_correct_answer}\n"
                 f"💬 {comment}"
             )
         else:
             logging.info(f"Answer is incorrect for user {user_id}")
             await update.message.reply_text("❌ Неверно, попробуйте еще раз!")
-
-        # Cancel the timer task to avoid duplicate "time's up" message
-        if session.get("timer_task") and not session.get("timer_task").done():
-            logging.info(f"Canceling timer for user {user_id}")
-            session["timer_task"].cancel()
-            session["timer_task"] = None
+            # Allow answering again for incorrect answers
+            user_sessions[user_id]["answered"] = False
             
     except Exception as e:
         logging.error(f"Error processing answer: {e}", exc_info=True)
         await update.message.reply_text("⚠️ Произошла ошибка при обработке ответа. Попробуйте еще раз или запросите новый вопрос.")
+        # Reset answer state on error
+        user_sessions[user_id]["answered"] = False
 
 def get_small_hint(answer):
     """Provides a small hint about the answer without giving too much away"""
