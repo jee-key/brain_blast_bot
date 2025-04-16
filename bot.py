@@ -181,6 +181,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("reveal_answer:"):
         user_id = int(query.data.split(":")[1])
         logging.info(f"Processing reveal_answer for user {user_id}")
+        chat_id = query.message.chat_id
         
         # Get session data
         session = user_sessions.get(user_id, {})
@@ -196,13 +197,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
             ]
             
-            await query.message.reply_text(
-                f"📝 Ответ: {answer}\n💬 {comment}", 
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+            try:
+                # Use context.bot.send_message instead of query.message.reply_text
+                await context.bot.send_message(
+                    chat_id,
+                    f"📝 Ответ: {answer}\n💬 {comment}", 
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                logging.info(f"Sent answer reveal message to user {user_id}")
+            except Exception as e:
+                logging.error(f"Error sending reveal answer message: {e}", exc_info=True)
+                try:
+                    # Try with simpler message if fails
+                    await context.bot.send_message(
+                        chat_id,
+                        f"📝 Ответ: {answer}"
+                    )
+                except Exception as e2:
+                    logging.error(f"Failed to send even simple answer reveal: {e2}")
         else:
             logging.warning(f"Session not found for user {user_id} in reveal_answer")
-            
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    "⚠️ Не удалось найти информацию о вопросе. Попробуйте запросить новый вопрос."
+                )
+            except Exception as e:
+                logging.error(f"Failed to send session not found message: {e}")
+
     if query.data == "continue_iteration":
         user_id = query.from_user.id
         mode = user_modes.get(user_id, "normal")
@@ -264,32 +286,33 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
     user_answer = update.message.text.strip()
+    chat_id = update.message.chat_id
+    message_id = update.message.message_id
     logging.info(f"Processing answer from user {user_id} ({name}): '{user_answer}'")
     
+    # Acquire session info
     session = user_sessions.get(user_id)
     if not session:
         logging.error(f"No active session found for user {user_id}")
-        await update.message.reply_text("🤔 У вас сейчас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать.")
+        await context.bot.send_message(chat_id, "🤔 У вас сейчас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать.")
         return
 
     logging.info(f"Active session found for user {user_id}, answered: {session.get('answered', False)}")
     
+    # If user already answered correctly, inform them
     if session.get("answered", False) and session.get("correct_answer", False):
-        await update.message.reply_text("✅ Вы уже ответили верно на этот вопрос.")
+        await context.bot.send_message(chat_id, "✅ Вы уже ответили верно на этот вопрос.")
         return
-    elif session.get("answered", False):
-        # If they answered but it wasn't correct, let them try again
-        logging.info(f"User {user_id} already answered incorrectly, letting them try again")
+    
+    # Store the last message ID to prevent duplicate answer processing
+    last_processed = session.get("last_processed_id", 0)
+    if last_processed == message_id:
+        logging.info(f"Already processed message {message_id} for user {user_id}, skipping")
+        return
         
-    # Cancel the timer immediately to prevent "Time's up!" message
-    if session.get("timer_task") and not session.get("timer_task").done():
-        logging.info(f"Canceling timer for user {user_id}")
-        try:
-            session["timer_task"].cancel()
-            session["timer_task"] = None
-        except Exception as e:
-            logging.error(f"Error canceling timer: {e}")
-
+    # Mark this message as being processed
+    session["last_processed_id"] = message_id
+    
     # Process the answer
     try:
         correct_answer = session["q"]["answer"]
@@ -391,6 +414,15 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             logging.info(f"Alternative answer accepted based on comment containing '{indicator}'")
                             break
 
+        # Cancel the timer immediately if it exists
+        if session.get("timer_task") and not session.get("timer_task").done():
+            logging.info(f"Canceling timer for user {user_id}")
+            try:
+                session["timer_task"].cancel()
+                session["timer_task"] = None
+            except Exception as e:
+                logging.error(f"Error canceling timer: {e}")
+                
         # Provide feedback to the user
         if is_correct:
             # Mark as correctly answered
@@ -404,28 +436,25 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Prepare response with comment if available
             comment = session["q"].get("comment") or "Без комментария."
             
-            # Send confirmation message
+            # Send confirmation message - use context.bot.send_message directly to ensure delivery
             try:
-                await update.message.reply_text(
-                    f"✅ Правильно! Вы ответили верно.\n\n"
-                    f"📝 Ответ: {original_correct_answer}\n"
-                    f"💬 {comment}"
-                )
+                response_text = f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {original_correct_answer}\n💬 {comment}"
+                await context.bot.send_message(chat_id, response_text)
                 logging.info(f"Sent correct answer confirmation to user {user_id}")
             except Exception as e:
                 logging.error(f"Failed to send correct answer message: {e}", exc_info=True)
                 # Try again with a simpler message
                 try:
-                    await update.message.reply_text("✅ Правильно!")
-                except:
-                    logging.error("Failed to send even simple confirmation message")
+                    await context.bot.send_message(chat_id, "✅ Правильно!")
+                except Exception as e2:
+                    logging.error(f"Failed to send even simple confirmation message: {e2}")
         else:
             logging.info(f"Answer is incorrect for user {user_id}")
             # Allow answering again for incorrect answers
             user_sessions[user_id]["answered"] = False
             
             try:
-                await update.message.reply_text("❌ Неверно, попробуйте еще раз!")
+                await context.bot.send_message(chat_id, "❌ Неверно, попробуйте еще раз!")
                 logging.info(f"Sent incorrect answer message to user {user_id}")
             except Exception as e:
                 logging.error(f"Failed to send incorrect answer message: {e}", exc_info=True)
@@ -437,7 +466,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_sessions[user_id]["answered"] = False
         
         try:
-            await update.message.reply_text("⚠️ Произошла ошибка при обработке ответа. Попробуйте еще раз или запросите новый вопрос.")
+            await context.bot.send_message(chat_id, "⚠️ Произошла ошибка при обработке ответа. Попробуйте еще раз или запросите новый вопрос.")
         except Exception as msg_error:
             logging.error(f"Failed to send error message: {msg_error}")
 
