@@ -66,6 +66,12 @@ async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    # Get user ID directly from the query
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    
+    logging.info(f"Button pressed: {query.data} by user {user_id}")
 
     if query.data.startswith("set_mode:"):
         mode = query.data.split(":")[1]
@@ -179,14 +185,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"🏆 Топ игроков:\n{text}")
         
     if query.data.startswith("reveal_answer:"):
-        user_id = int(query.data.split(":")[1])
-        logging.info(f"Processing reveal_answer for user {user_id}, pressed by {query.from_user.id}")
+        # Extract target user ID from the button data
+        target_user_id = int(query.data.split(":")[1])
+        logging.info(f"Processing reveal_answer for user {target_user_id}, pressed by {user_id}")
         
-        # Get the chat ID directly from the query
-        chat_id = query.message.chat_id
-        
-        # Get session data
-        session = user_sessions.get(user_id, {})
+        # Get session data - use the target user ID, not the button presser's ID
+        session = user_sessions.get(target_user_id, {})
         
         if session and "q" in session:
             answer = session["q"]["answer"]
@@ -199,20 +203,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
             ]
             
+            # Cancel any active timer, even though it should already be done
+            if session.get("timer_task") and not session.get("timer_task").done():
+                try:
+                    session["timer_task"].cancel()
+                    session["timer_task"] = None
+                    logging.info(f"Timer cancelled for user {target_user_id} when showing answer")
+                except Exception as e:
+                    logging.error(f"Failed to cancel timer: {e}")
+            
+            # Mark as answered to prevent duplicate answer processing
+            user_sessions[target_user_id]["answered"] = True
+            
+            # Send answer using context.bot.send_message for maximum reliability
             try:
-                # First try to cancel any active timer for this user
-                if session.get("timer_task") and not session.get("timer_task").done():
-                    try:
-                        session["timer_task"].cancel()
-                        session["timer_task"] = None
-                        logging.info(f"Timer cancelled for user {user_id} when showing answer")
-                    except Exception as e:
-                        logging.error(f"Failed to cancel timer: {e}")
-                
-                # Mark as answered to prevent duplicate answer processing
-                user_sessions[user_id]["answered"] = True
-                
-                # Send answer directly using context.bot instead of query.message.reply_text
                 message_text = f"📝 Ответ: {answer}\n💬 {comment}"
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -221,9 +225,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 logging.info(f"✅ Successfully sent answer reveal message to chat {chat_id}")
             except Exception as e:
-                logging.error(f"❌ Error sending reveal answer message: {e}", exc_info=True)
+                logging.error(f"❌ Error sending reveal answer message: {e}")
                 try:
-                    # Try with simpler message if fails
+                    # Simpler fallback message
                     await context.bot.send_message(
                         chat_id=chat_id,
                         text=f"📝 Ответ: {answer}"
@@ -232,7 +236,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e2:
                     logging.error(f"Failed to send even simple answer reveal: {e2}")
         else:
-            logging.warning(f"Session not found for user {user_id} in reveal_answer")
+            logging.warning(f"Session not found for user {target_user_id} in reveal_answer")
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -240,6 +244,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logging.error(f"Failed to send session not found message: {e}")
+        return
 
     if query.data == "continue_iteration":
         user_id = query.from_user.id
@@ -300,7 +305,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Answer handler with improved post-timeout handling and answer validation
+    Completely independent answer handler that works regardless of timer state
     """
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
@@ -309,7 +314,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"ANSWER RECEIVED from user {user_id}: '{user_answer}'")
     
-    # Step 1: Check if user has an active session
+    # Step 1: Check if user has an active session with a question
     session = user_sessions.get(user_id)
     if not session or "q" not in session:
         await context.bot.send_message(
@@ -318,16 +323,23 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Step 2: Send immediate acknowledgment
-    try:
+    # Step 2: Get correct answer from question
+    correct_answer = session["q"].get("answer", "")
+    comment = session["q"].get("comment") or "Без комментария."
+    
+    if not correct_answer:
+        logging.error(f"No correct answer found for user {user_id}")
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⏳ Твой ответ принят и обрабатывается..."
+            text="Произошла ошибка при обработке вопроса. Пожалуйста, запросите новый вопрос."
         )
-    except Exception as e:
-        logging.error(f"Failed to send acknowledgment: {e}")
+        return
     
-    # Step 3: Immediately cancel timer if it exists
+    # Step 3: Check if answer is correct using our matching function
+    is_correct = check_answer(user_answer, correct_answer)
+    logging.info(f"Answer check result for user {user_id}: {is_correct}")
+    
+    # Step 4: Always try to cancel timer regardless of state
     try:
         if session.get("timer_task") and not session.get("timer_task").done():
             session["timer_task"].cancel()
@@ -336,21 +348,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Failed to cancel timer: {e}")
     
-    # Step 4: Check if already answered correctly
-    if session.get("correct_answer", False):
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Вы уже ответили верно на этот вопрос."
-        )
-        return
-    
-    # Step 5: Check answer correctness REGARDLESS of timeout
-    correct_answer = session["q"].get("answer", "")
-    comment = session["q"].get("comment") or "Без комментария."
-    
-    is_correct = check_answer(user_answer, correct_answer)
-    
-    # Step 6: Process result
+    # Step 5: Process the answer
     if is_correct:
         # Mark as correctly answered
         user_sessions[user_id]["answered"] = True
@@ -359,33 +357,29 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Update user score
         try:
             increment_score(user_id, name)
+            logging.info(f"Score incremented for user {user_id}")
         except Exception as e:
             logging.error(f"Failed to increment score: {e}")
         
         # Send correct answer confirmation
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}"
-        )
-    else:
-        # Check if timeout already occurred (answered=True but correct_answer not set)
-        if session.get("answered", False) and not session.get("correct_answer", False):
-            # Time's up already happened, show the answer button
-            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
+        try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="❌ Неверно. Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                text=f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}"
             )
-        else:
-            # Time hasn't expired yet, allow another attempt
-            user_sessions[user_id]["answered"] = False
-            
-            # Send incorrect answer notification
+            logging.info(f"Sent correct answer message to user {user_id}")
+        except Exception as e:
+            logging.error(f"Failed to send correct answer message: {e}")
+    else:
+        # Send incorrect answer message
+        try:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="❌ Неверно, попробуйте еще раз!"
             )
+            logging.info(f"Sent incorrect answer message to user {user_id}")
+        except Exception as e:
+            logging.error(f"Failed to send incorrect message: {e}")
 
 def check_answer(user_answer, correct_answer):
     """
