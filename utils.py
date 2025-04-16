@@ -1,342 +1,238 @@
 import asyncio
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-import re
 import logging
-import os
+import time
+import datetime
+import re
+import random
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-# Global variable shared with bot.py
+# Global user session storage
 user_sessions = {}
 
-# Get environment variable for hints
-ENABLE_HINTS = os.getenv("ENABLE_HINTS", "true").lower() == "true"
+# Default timer settings
+DEFAULT_TIMER = 60  # seconds
 
-# Add normalize_answer function for consistent answer processing
 def normalize_answer(text):
-    """
-    Normalizes answer text for more accurate comparison.
-    - Removes punctuation, extra spaces, quotes
-    - Removes content in parentheses and brackets
-    - Converts to lowercase
-    """
+    """Normalizes an answer for comparison"""
     if not text:
         return ""
-        
+    
     # Convert to lowercase
     text = text.lower()
     
-    # Remove content in parentheses and brackets
-    text = re.sub(r'\(.+?\)', '', text)  # Remove content in parentheses
-    text = re.sub(r'\[.+?\]', '', text)  # Remove content in square brackets
+    # Remove all punctuation except hyphens and spaces
+    text = re.sub(r'[^\w\s-]', '', text)
     
-    # Remove quotes and special characters
-    text = re.sub(r'[\"«»„""]', '', text)  # Remove various quotes
-    text = re.sub(r'[.,;:!?]', '', text)  # Remove punctuation
-    
-    # Replace multiple spaces with a single space and trim
+    # Replace multiple spaces with a single space
     text = re.sub(r'\s+', ' ', text).strip()
     
-    return text
-
-async def start_timer(chat_id, context, user_id, q, mode):
-    global user_sessions
-
-    MODE_CONFIG = {
-        "normal": {"total_time": 60, "hint_time": 30, "show_hint": True},
-        "speed": {"total_time": 30, "hint_time": 0, "show_hint": False},
-        "no_hints": {"total_time": 50, "hint_time": 0, "show_hint": False}
+    # Remove unnecessary articles and pronouns that don't affect meaning
+    stop_words = [' и ', ' или ', ' a ', ' an ', ' the ']
+    for word in stop_words:
+        text = text.replace(word, ' ')
+    
+    # Normalize some Russian letters that might be mistyped
+    replacements = {
+        'ё': 'е',
+        'й': 'и',
+        'ъ': 'ь',
     }
-
-    config = MODE_CONFIG.get(mode, MODE_CONFIG["normal"])
-
-    if user_id not in user_sessions:
-        logging.warning(f"[timer] Error: no session for user {user_id}")
-        return
-
-    # Store the current task so it can be cancelled if needed
-    current_task = asyncio.current_task()
-    user_sessions[user_id]["timer_task"] = current_task
+    for old, new in replacements.items():
+        text = text.replace(old, new)
     
-    # Add input_processing flag to prevent race conditions
-    user_sessions[user_id]["input_processing"] = False
-    
-    # Reset timer_expired flag
-    user_sessions[user_id]["timer_expired"] = False
-    
-    # Add a new flag to track if the timer is in the grace period
-    user_sessions[user_id]["timer_grace_period"] = False
-    
-    # Add new flag to prioritize user answers
-    user_sessions[user_id]["answer_priority"] = True
+    return text.strip()
 
-    try:
-        # Calculate reading time based on question length and images
-        question_text = q.get("question", "")
-        words_count = len(question_text.split())
-        reading_time = min(20, max(5, (words_count // 15) * 5))
-
-        if q.get("image_urls"):
-            reading_time += 5 * len(q.get("image_urls", []))
-
-        # First check - if user already answered
-        if user_id not in user_sessions:
-            logging.info(f"[timer] User session {user_id} removed before timer started")
-            return
-
-        session = user_sessions.get(user_id, {})
-        if session.get("answered") or session.get("correct_answer"):
-            logging.info(f"[timer] User {user_id} already answered, skipping timer")
-            return
-
-        # Send reading time message
-        if reading_time > 5 and mode != "blind":
-            try:
-                await context.bot.send_message(
-                    chat_id, 
-                    f"⏳ У вас есть {reading_time} секунд на чтение вопроса."
-                )
-                logging.info(f"[timer] Sent reading time message to user {user_id}")
-            except Exception as e:
-                logging.error(f"[timer] Error sending reading time message: {e}")
-
-        # Wait for reading time with periodic checks
-        for _ in range(reading_time):
-            await asyncio.sleep(1)
-            # Check if session still exists or user answered
-            if user_id not in user_sessions:
-                logging.info(f"[timer] User session {user_id} removed during reading time")
-                return
-                
-            session = user_sessions.get(user_id, {})
-            if session.get("answered") or session.get("correct_answer") or session.get("input_processing"):
-                logging.info(f"[timer] User {user_id} answered or is processing input during reading time")
-                return
-
-        # Another check before sending timer start message
-        if user_id not in user_sessions:
-            return
-            
-        session = user_sessions.get(user_id, {})
-        if session.get("answered") or session.get("correct_answer") or session.get("input_processing"):
-            return
-
-        # Send timer start message
-        if mode != "blind":
-            try:
-                await context.bot.send_message(
-                    chat_id, 
-                    f"⏱️ Отсчет времени начался! ({config['total_time']} секунд)"
-                )
-                logging.info(f"[timer] Started countdown for user {user_id}")
-            except Exception as e:
-                logging.error(f"[timer] Error sending timer start message: {e}")
-
-        # Wait for answering time, checking each second if user has answered
-        for i in range(config['total_time']):
-            await asyncio.sleep(1)
-            
-            # Check if session still exists or user answered
-            if user_id not in user_sessions:
-                logging.info(f"[timer] User session {user_id} removed during answer time")
-                return
-                
-            session = user_sessions.get(user_id, {})
-            
-            # Check if an answer is being processed or has been processed
-            if session.get("timer_expired"):
-                logging.info(f"[timer] Timer already expired for user {user_id}")
-                return
-                
-            if session.get("answered") or session.get("correct_answer"):
-                logging.info(f"[timer] User {user_id} answered during answer time, stopping timer")
-                return
-                
-            # CRITICAL: Check if user is currently typing/sending an answer
-            if session.get("input_processing"):
-                logging.info(f"[timer] User {user_id} input processing detected, halting timer")
-                # Wait longer to let the input processing complete
-                await asyncio.sleep(5)  # Increased from 3s to 5s
-                # Check again after waiting
-                if user_id not in user_sessions:
-                    return
-                session = user_sessions.get(user_id, {})
-                if session.get("answered") or session.get("correct_answer"):
-                    logging.info(f"[timer] Input was processed successfully, stopping timer")
-                    return
-                # Reset the flag as it may have been a false detection
-                if session.get("input_processing"):
-                    session["input_processing"] = False
-                
-            # Send hint at halfway point if enabled for this mode
-            if config["show_hint"] and i == config["hint_time"] and ENABLE_HINTS:
-                # Just to be extra safe, check one more time right before sending
-                if user_id not in user_sessions:
-                    return
-                    
-                session = user_sessions.get(user_id, {})
-                if session.get("answered") or session.get("correct_answer") or session.get("input_processing"):
-                    return
-                
-                answer = q.get("answer", "")
-                hint = format_hint(answer)
-                
-                try:
-                    await context.bot.send_message(
-                        chat_id, 
-                        f"💡 Подсказка: {hint}"
-                    )
-                    logging.info(f"[timer] Sent hint to user {user_id}")
-                except Exception as e:
-                    logging.error(f"[timer] Error sending hint: {e}")
-
-        # Final check before time's up message
-        if user_id not in user_sessions:
-            return
-            
-        session = user_sessions.get(user_id, {})
-        
-        # Enter grace period - this is critical to handle last-millisecond responses
-        if user_id in user_sessions:
-            user_sessions[user_id]["timer_grace_period"] = True
-            logging.info(f"[timer] Entering grace period for user {user_id}")
-        
-        # NEW: Add longer delays before marking timer as expired
-        # First delay - check for immediate responses
-        await asyncio.sleep(2.0)  # Increased from 1.0s to 2.0s
-        
-        # Check for answers that arrived during first delay
-        if user_id not in user_sessions:
-            return
-            
-        session = user_sessions.get(user_id, {})
-        if session.get("answered") or session.get("correct_answer"):
-            logging.info(f"[timer] User answered during first delay period")
-            return
-            
-        # Extra delay if input is being processed
-        if session.get("input_processing"):
-            logging.info(f"[timer] Last-second input detected before timer expiry, giving extra time")
-            # Give a much longer delay for last-second inputs
-            await asyncio.sleep(8.0)  # Increased from 5.0s to 8.0s
-            
-            # Check again after the longer delay
-            if user_id not in user_sessions:
-                return
-                
-            session = user_sessions.get(user_id, {})
-            if session.get("answered") or session.get("correct_answer"):
-                logging.info(f"[timer] Input was processed during extended delay, stopping timer")
-                return
-        
-        # Final protection delay - giving absolute priority to any in-flight message processing
-        await asyncio.sleep(3.0)  # Increased from 2.0s to 3.0s
-        
-        if user_id not in user_sessions:
-            return
-            
-        session = user_sessions.get(user_id, {})
-        
-        # Exit grace period
-        if user_id in user_sessions:
-            user_sessions[user_id]["timer_grace_period"] = False
-            logging.info(f"[timer] Exiting grace period for user {user_id}")
-        
-        # Final message check
-        if session.get("answered") or session.get("correct_answer") or session.get("input_processing"):
-            logging.info(f"[timer] Last millisecond check: user appears to be answering or has answered")
-            return
-        
-        # CRITICAL: Check for the answer_priority flag
-        if session.get("answer_priority"):
-            # Give one last chance for any in-flight answer to be processed
-            user_sessions[user_id]["answer_priority"] = False
-            logging.info(f"[timer] Final answer priority period for user {user_id}")
-            await asyncio.sleep(1.0)
-            
-            # Check again after the priority period
-            if user_id not in user_sessions:
-                return
-                
-            session = user_sessions.get(user_id, {})
-            if session.get("answered") or session.get("correct_answer"):
-                logging.info(f"[timer] Answer processed during priority period")
-                return
-        
-        # CRITICAL: Set flags in a careful order with logging
-        if user_id in user_sessions:
-            # First set timer_expired flag 
-            user_sessions[user_id]["timer_expired"] = True
-            logging.info(f"[timer] Setting timer_expired flag for user {user_id}")
-            
-            # For safety, add a delay between flag settings
-            await asyncio.sleep(1.0)  # Increased from 0.5s to 1.0s
-            
-            # Check one more time before marking as answered
-            if user_id in user_sessions and not session.get("answered") and not session.get("correct_answer"):
-                user_sessions[user_id]["answered"] = True
-                logging.info(f"[timer] Time's up for user {user_id}, marking as answered")
-                
-                # Send time's up message with answer reveal button
-                keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
-                try:
-                    await context.bot.send_message(
-                        chat_id, 
-                        "⏰ Время вышло!", 
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                    logging.info(f"[timer] Sent time's up message to user {user_id}")
-                except Exception as e:
-                    logging.error(f"[timer] Error sending time's up message: {e}")
-    except asyncio.CancelledError:
-        logging.info(f"[timer] Timer for user {user_id} was cancelled (answer received)")  # Fixed the bracket
-        
-        # Cleanup flags in case of cancellation
-        if user_id in user_sessions:
-            # Ensure the timer_expired flag is NOT set when cancelled
-            user_sessions[user_id]["timer_expired"] = False
-            logging.info(f"[timer] Reset timer_expired flag due to cancellation")
-            
-            # Also ensure grace period is exited
-            user_sessions[user_id]["timer_grace_period"] = False
-            logging.info(f"[timer] Reset grace period flag due to cancellation")
-            
-        return
-    except Exception as e:
-        logging.error(f"[timer] Timer error: {e}", exc_info=True)
-
-def format_hint(answer: str) -> str:
+def format_hint(answer, revealed_percentage):
     """
-    Creates a subtle hint based on the answer.
-    Designed to give just enough information without revealing too much.
+    Format a partially revealed answer hint
     """
     if not answer:
-        return "Подсказка недоступна."
+        return "Ошибка: нет ответа для подсказки"
     
-    # Clean the answer from brackets and extra annotations
-    clean_answer = re.sub(r'\(.+?\)', '', answer)  # Remove content in parentheses
-    clean_answer = re.sub(r'\[.+?\]', '', clean_answer)  # Remove content in square brackets
-    clean_answer = re.sub(r'[\"«»]', '', clean_answer)  # Remove quotes
-    clean_answer = re.sub(r'\s+', ' ', clean_answer).strip()  # Normalize whitespace
+    # Get the number of characters to reveal
+    hint_length = max(1, int(len(answer) * revealed_percentage))
     
-    # If answer is empty after cleaning, use the original
-    if not clean_answer:
-        clean_answer = answer
+    # Create the hint by revealing some characters
+    hint = ""
+    for i, char in enumerate(answer):
+        if i < hint_length:
+            hint += char
+        elif char == " ":
+            hint += " "  # Keep spaces for readability
+        else:
+            hint += "•"  # Use a dot for unrevealed characters
     
-    words = clean_answer.split()
-    total_chars = len(''.join(words))
+    return hint
+
+async def start_timer(chat_id, context, user_id, question_data, mode="normal"):
+    """
+    Start a timer for a question with proper cleanup.
     
-    # Different hint strategies based on answer type
-    if len(words) > 1:  # Multi-word answer
-        # Count total letters (excluding spaces)
+    Args:
+        chat_id: The chat ID to send the message to
+        context: The context object from the handler
+        user_id: The user ID to set the timer for
+        question_data: Complete question data object
+        mode: Game mode (normal, speed, no_hints)
+    """
+    # Cancel any existing timer for this user
+    if user_id in user_sessions and user_sessions[user_id].get("timer_task"):
+        try:
+            user_sessions[user_id]["timer_task"].cancel()
+            logging.info(f"Cancelled existing timer for user {user_id}")
+        except Exception as e:
+            logging.error(f"Error cancelling timer: {e}")
+    
+    # Set up session data
+    session = user_sessions.get(user_id, {})
+    session.update({
+        "q": question_data,
+        "mode": mode,
+        "answered": False,
+        "timer_expired": False,
+        "input_processing": False,
+        "start_time": time.time(),
+        "timer_expired_timestamp": None  # Track exact time when timer expires
+    })
+    user_sessions[user_id] = session
+    
+    # Determine timer duration based on mode
+    from bot import MODE_TIMES
+    timer_duration = MODE_TIMES.get(mode, DEFAULT_TIMER)  # Default: 60 seconds
+    
+    # Start the timer as a background task
+    timer_task = asyncio.create_task(
+        _run_timer(chat_id, context, user_id, timer_duration, mode, question_data)
+    )
+    user_sessions[user_id]["timer_task"] = timer_task
+    logging.info(f"Started timer for user {user_id} in mode {mode}: {timer_duration} seconds")
+
+async def _run_timer(chat_id, context, user_id, duration, mode, question_data):
+    """
+    Run the timer with hints and expiration handling.
+    Improved with more precise timing and race condition handling.
+    """
+    # Extract needed data
+    from bot import ENABLE_HINTS
+    answer = question_data.get("answer", "")
+    
+    # Calculate hint times (25%, 50%, 75% of duration)
+    show_hints = ENABLE_HINTS and mode != "no_hints"
+    
+    if show_hints:
+        hint_times = [
+            duration * 0.25,  # First hint at 25% of time
+            duration * 0.5,   # Second hint at 50% of time
+            duration * 0.75   # Third hint at 75% of time
+        ]
+    else:
+        # No hints for no_hints mode
+        hint_times = []
+    
+    # Start countdown
+    elapsed = 0
+    interval = 0.5  # Check every half-second for more precise timing
+    
+    # Pre-calculate and optimize hint messages to reduce delay
+    if show_hints:
+        hint_messages = [
+            f"🕒 Осталось {int(duration * 0.75)} секунд\nПодсказка: {format_hint(answer, 0.25)}",
+            f"🕒 Осталось {int(duration * 0.5)} секунд\nПодсказка: {format_hint(answer, 0.5)}",
+            f"⚠️ Осталось {int(duration * 0.25)} секунд\nПодсказка: {format_hint(answer, 0.75)}"
+        ]
+    
+    try:
+        # Record the start time for precise timing
+        start_time = time.time()
         
-        # Just give number of words and total letters
-        return f"Ответ содержит {len(words)} слов ({total_chars} букв)"
+        while elapsed < duration:
+            # If answer already processed, exit early
+            session = user_sessions.get(user_id, {})
+            if session.get("answered", False):
+                logging.info(f"Timer stopped early - question already answered by user {user_id}")
+                return
+            
+            # If input is currently being processed, add additional grace time
+            # This is critical for last-second answers
+            if session.get("input_processing", False):
+                logging.info(f"⚠️ [SYNC] Detected input processing during timer check - adding grace period")
+                # Continue with loop to give input processing time to complete
+                await asyncio.sleep(interval)
+                elapsed = time.time() - start_time
+                continue
+            
+            # Precise sleep for each interval
+            await asyncio.sleep(interval)
+            elapsed = time.time() - start_time
+            
+            # Check if it's time for a hint
+            if show_hints and hint_times and elapsed >= hint_times[0]:
+                hint_index = len(hint_times) - len(hint_times)
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id, 
+                        text=hint_messages[hint_index]
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to send hint: {e}")
+                
+                hint_times.pop(0)  # Remove this hint time
         
-    else:  # Single-word answer
-        word = words[0]
+        # Before declaring time's up, check once more if input is being processed
+        session = user_sessions.get(user_id, {})
+        if session.get("input_processing", False):
+            logging.info(f"⚠️ [SYNC] Critical race condition detected - user is processing input exactly as timer expires")
+            # Wait a bit longer to let the input processing complete
+            await asyncio.sleep(2.0)
+            
+            # Re-check if user answered during this extended grace period
+            session = user_sessions.get(user_id, {})
+            if session.get("answered", False):
+                logging.info(f"User {user_id} answered during extended input processing grace period")
+                return
         
-        if len(word) <= 3:  # Very short word
-            return f"Ответ - короткое слово из {len(word)} букв"
+        # Time is up - set timer_expired flag with timestamp for precise timing
+        now = datetime.datetime.now()
+        timer_expired_timestamp = now.timestamp()
         
-        # For longer words, just give length and first letter
-        first_letter = word[0].upper()
-        return f"Ответ - слово из {len(word)} букв, начинается на '{first_letter}'"
+        # Add precise timestamp logging for when timer actually expired
+        timestamp = now.strftime("%H:%M:%S.%f")[:-3]  # Include milliseconds
+        logging.info(f"⏰ TIMER EXPIRED for user {user_id} at {timestamp}")
+        
+        # Store precise expiration timestamp
+        if user_id in user_sessions:
+            user_sessions[user_id]["timer_expired"] = True
+            user_sessions[user_id]["timer_expired_timestamp"] = timer_expired_timestamp
+            logging.info(f"⚠️ Timer expired for user {user_id} at exact time: {timestamp}")
+        
+        # Add 2.0 second grace period for answers coming in right at timer expiration
+        # This is crucial for the "I answered at 22:07:30" issue
+        grace_period = 2.0  # 2 seconds grace period
+        await asyncio.sleep(grace_period)
+        logging.info(f"Grace period of {grace_period} seconds applied for user {user_id}")
+        
+        # Recheck if user answered during grace period
+        session = user_sessions.get(user_id, {})
+        if session.get("answered", False) or session.get("input_processing", False):
+            logging.info(f"User {user_id} answered during grace period - no timeout message needed")
+            return
+        
+        # No answer during grace period, show time's up message
+        try:
+            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⏰ Время вышло! Нажмите кнопку, чтобы увидеть ответ.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logging.error(f"Failed to send time's up message: {e}")
+    
+    except asyncio.CancelledError:
+        # Timer was cancelled gracefully, just log it
+        logging.info(f"Timer cancelled for user {user_id}")
+        raise
+    except Exception as e:
+        # Any other exception in the timer
+        logging.error(f"Timer error for user {user_id}: {e}")

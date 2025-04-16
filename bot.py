@@ -603,13 +603,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text.strip()
     chat_id = update.message.chat_id
     
-    logging.info(f"🔍 INCOMING MESSAGE from user {user_id}: '{message_text}'")
+    # Add timestamp logging to precisely track when the message was received
+    import datetime
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%H:%M:%S.%f")[:-3]  # Include milliseconds
+    
+    logging.info(f"🔍 INCOMING MESSAGE from user {user_id} at {timestamp}: '{message_text}'")
     
     # STEP 1: Set input_processing flag FIRST to block timer expiration
     session = user_sessions.get(user_id, {})
     if session:
         session["input_processing"] = True
         logging.info(f"⚠️ [SYNC] Set input_processing flag for user {user_id}")
+        
+        # Add a grace period of 2 seconds for borderline answers
+        if session.get("timer_expired"):
+            timer_expired_time = session.get("timer_expired_timestamp", 0)
+            current_time = datetime.datetime.now().timestamp()
+            time_difference = current_time - timer_expired_time
+            
+            # If answer came within 2 seconds of timer expiration, consider it on time
+            if time_difference < 2.0:
+                logging.info(f"⚠️ [TIMING] Answer received {time_difference:.2f} seconds after timer expiration - applying grace period")
+                session["timer_expired"] = False
+                logging.info(f"⚠️ [TIMING] Reset timer_expired flag for borderline answer")
         
     # STEP 2: Try to cancel any running timer - but continue even if it fails
     if session and session.get("timer_task") and not session.get("timer_task").done():
