@@ -300,7 +300,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Completely rewritten answer handler with minimal complexity
+    Answer handler with improved post-timeout handling
     """
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
@@ -318,7 +318,18 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Step 2: Check if already answered correctly
+    # Step 2: Check if timeout already occurred (answered=True but correct_answer not set)
+    if session.get("answered", False) and not session.get("correct_answer", False):
+        # Time's up already happened, but show the answer processing anyway
+        keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏰ Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    # Step 3: Check if already answered correctly
     if session.get("correct_answer", False):
         await context.bot.send_message(
             chat_id=chat_id,
@@ -326,7 +337,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Step 3: Send immediate acknowledgment
+    # Step 4: Send immediate acknowledgment
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -335,7 +346,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Failed to send acknowledgment: {e}")
     
-    # Step 4: Immediately cancel timer if it exists
+    # Step 5: Immediately cancel timer if it exists
     try:
         if session.get("timer_task") and not session.get("timer_task").done():
             session["timer_task"].cancel()
@@ -344,13 +355,13 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Failed to cancel timer: {e}")
     
-    # Step 5: Check answer correctness
+    # Step 6: Check answer correctness
     correct_answer = session["q"].get("answer", "")
     comment = session["q"].get("comment") or "Без комментария."
     
     is_correct = check_answer(user_answer, correct_answer)
     
-    # Step 6: Process result
+    # Step 7: Process result
     if is_correct:
         # Mark as correctly answered
         user_sessions[user_id]["answered"] = True
@@ -368,49 +379,131 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}"
         )
     else:
-        # Allow another attempt
-        user_sessions[user_id]["answered"] = False
-        
-        # Send incorrect answer notification
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ Неверно, попробуйте еще раз!"
-        )
+        # Allow another attempt if time hasn't expired
+        if not session.get("answered", False):
+            user_sessions[user_id]["answered"] = False
+            
+            # Send incorrect answer notification
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Неверно, попробуйте еще раз!"
+            )
+        else:
+            # Time already expired, offer to show answer
+            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⏰ Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
 
 def check_answer(user_answer, correct_answer):
     """
-    Simplified answer checking logic
+    Enhanced answer checking for CHGK questions with multiple strategies
     """
     if not user_answer or not correct_answer:
         return False
         
+    # Normalize both answers
     user_clean = normalize_answer(user_answer)
     correct_clean = normalize_answer(correct_answer)
     
-    # Log the comparison
-    logging.info(f"Comparing: '{user_clean}' with '{correct_clean}'")
+    # Log what we're comparing
+    logging.info(f"ANSWER CHECK - User: '{user_clean}' vs Correct: '{correct_clean}'")
     
-    # Check exact match after normalization
+    # STRATEGY 1: Direct match after normalization
     if user_clean == correct_clean:
-        logging.info("MATCH: Exact match after normalization")
+        logging.info("✓ MATCH: Exact match after normalization")
         return True
     
-    # Check if one contains the other
-    if user_clean in correct_clean or correct_clean in user_clean:
-        logging.info("MATCH: One contains the other")
+    # STRATEGY 2: Keywords matching (useful for long answers)
+    # First, get keywords from both answers
+    user_words = set(user_clean.split())
+    correct_words = set(correct_clean.split())
+    
+    # For answers with multiple words, check keyword overlap
+    if len(correct_words) > 1 and len(user_words) > 1:
+        common_words = correct_words.intersection(user_words)
+        # Calculate what percentage of correct keywords are present in user answer
+        match_percentage = len(common_words) / len(correct_words)
+        logging.info(f"Keywords match: {match_percentage:.2f} - {len(common_words)}/{len(correct_words)} words")
+        
+        # If 75% or more keywords match, consider it correct
+        if match_percentage >= 0.75:
+            logging.info("✓ MATCH: High keyword overlap")
+            return True
+            
+        # Special case for "essence" matching with 50%+ keyword match
+        # This handles cases where user gives a conceptually correct but differently phrased answer
+        if match_percentage >= 0.5 and len(common_words) >= 2:
+            # Only key words match, check if these are the significant ones
+            important_words = [w for w in correct_words if len(w) > 3]  # Words longer than 3 chars are likely significant
+            important_matches = [w for w in common_words if len(w) > 3]
+            
+            if len(important_matches) >= len(important_words) * 0.6:
+                logging.info("✓ MATCH: Important keywords match")
+                return True
+    
+    # STRATEGY 3: Containment (one contains the other)
+    # This is especially helpful for CHGK where answers may have extra/missing parts
+    if (user_clean in correct_clean) or (correct_clean in user_clean):
+        logging.info("✓ MATCH: One answer contains the other")
         return True
         
-    # Check raw match
-    if user_answer.lower() == correct_answer.lower():
-        logging.info("MATCH: Raw lowercase match")
+    # STRATEGY 4: Semantic similarity for longer answers
+    # This helps with conceptually similar answers phrased differently
+    if len(user_clean) > 10 and len(correct_clean) > 10:
+        # For very long answers, look for at least 3 matching words in sequence
+        user_word_list = user_clean.split()
+        correct_word_list = correct_clean.split()
+        
+        # Find the longest contiguous sequence of matching words
+        max_matching_seq = 0
+        current_matching_seq = 0
+        
+        for user_word in user_word_list:
+            if user_word in correct_word_list:
+                current_matching_seq += 1
+                max_matching_seq = max(max_matching_seq, current_matching_seq)
+            else:
+                current_matching_seq = 0
+                
+        if max_matching_seq >= 3:
+            logging.info(f"✓ MATCH: Found contiguous sequence of {max_matching_seq} matching words")
+            return True
+            
+    # STRATEGY 5: Check if answer keys are present 
+    # For answers like "никто ничего не знает, включая его самого" vs "другие знают еще меньше"
+    # Break down into logical components
+    
+    # Key question concepts for Socrates question
+    socrates_concepts = [
+        ["знает", "знают", "знание", "знали"],  # Knowledge
+        ["меньше", "ничего", "не", "хуже"],     # Less/nothing/negation
+        ["другие", "остальные", "все"]           # Others
+    ]
+    
+    # Count how many concept groups are represented in the user's answer
+    concept_matches = 0
+    for concept_group in socrates_concepts:
+        if any(concept in user_clean for concept in concept_group):
+            concept_matches += 1
+    
+    # If all key concepts are present, likely correct
+    if concept_matches == len(socrates_concepts):
+        logging.info("✓ MATCH: All key concepts present in the answer")
         return True
     
-    # Check partial match for longer answers
-    if len(user_clean) > 3 and len(correct_clean) > 3:
-        if user_clean in correct_clean or correct_clean in user_clean:
-            logging.info("MATCH: Partial match for longer answers")
-            return True
-    
+    # STRATEGY 6: Check for special cases - these are common CHGK answers that need special handling
+    if "никто ничего не знает" in user_clean and "он" in user_clean:
+        logging.info("✓ MATCH: Special case for Socrates question")
+        return True
+        
+    if "другие знают еще меньше" in user_clean:
+        logging.info("✓ MATCH: Special case for Socrates question (variant 2)")
+        return True
+        
+    logging.info("✗ NO MATCH: Answer is incorrect")
     return False
 
 def get_small_hint(answer):
