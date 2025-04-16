@@ -55,6 +55,9 @@ async def start_timer(chat_id, context, user_id, q, mode):
     # Store the current task so it can be cancelled if needed
     current_task = asyncio.current_task()
     user_sessions[user_id]["timer_task"] = current_task
+    
+    # *** CRITICAL FIX: Add a flag to track if timer expired ***
+    user_sessions[user_id]["timer_expired"] = False
 
     try:
         # Calculate reading time based on question length and images
@@ -128,6 +131,11 @@ async def start_timer(chat_id, context, user_id, q, mode):
                 return
                 
             session = user_sessions.get(user_id, {})
+            # *** CRITICAL FIX: Add check for timer_expired flag ***
+            if session.get("timer_expired"):
+                logging.info(f"[timer] Timer already expired and handled for user {user_id}")
+                return
+                
             if session.get("answered") or session.get("correct_answer"):
                 logging.info(f"[timer] User {user_id} answered during answer time, stopping timer")
                 return
@@ -162,6 +170,11 @@ async def start_timer(chat_id, context, user_id, q, mode):
         if session.get("answered") or session.get("correct_answer"):
             logging.info(f"[timer] User {user_id} answered at the last moment")
             return
+            
+        # *** CRITICAL FIX: Set timer_expired flag first ***
+        if user_id in user_sessions:
+            user_sessions[user_id]["timer_expired"] = True
+            logging.info(f"[timer] Setting timer_expired flag for user {user_id}")
 
         # Mark as answered to prevent duplicate answers
         if user_id in user_sessions:

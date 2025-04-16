@@ -310,35 +310,78 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Emergency ultra-reliable answer handler with triple confirmation
+    Обработчик ответов на вопросы с сохранением всех данных исходного вопроса
     """
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
     user_answer = update.message.text.strip()
     chat_id = update.message.chat_id
     
-    logging.info(f"🔥🔥🔥 EMERGENCY ANSWER HANDLER for user {user_id}: '{user_answer}'")
+    logging.info(f"🚨 ANSWER RECEIVED from user {user_id}: '{user_answer}'")
     
-    # 1. Send immediate acknowledgment
-    try:
-        await update.message.reply_text("⏳ Проверяю ваш ответ...")
-    except Exception as e:
-        logging.error(f"Failed first reply method: {e}")
-        try:
-            await context.bot.send_message(chat_id=chat_id, text="⏳ Проверяю ваш ответ...")
-        except Exception as e2:
-            logging.error(f"Failed second reply method: {e2}")
-    
-    # 2. Get session
+    # 1. Проверяем наличие активного вопроса
     session = user_sessions.get(user_id)
     if not session or "q" not in session:
-        try:
-            await update.message.reply_text("У вас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать.")
-        except:
-            await context.bot.send_message(chat_id=chat_id, text="У вас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="У вас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать."
+        )
         return
     
-    # 3. Cancel timer
+    # 2. Отправляем сообщение о проверке
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="⏳ Проверяю ваш ответ...")
+    except Exception as e:
+        logging.error(f"Failed to send acknowledgment: {e}")
+    
+    # 3. Получаем данные вопроса (сохраняются даже после истечения таймера)
+    q = session["q"]
+    correct_answer = q.get("answer", "")
+    comment = q.get("comment") or "Без комментария."
+    
+    # 4. Проверяем, истек ли таймер
+    if session.get("timer_expired", False):
+        logging.info(f"Timer already expired for user {user_id}, treating as late answer")
+        
+        # Проверяем правильность ответа
+        is_correct = check_answer(user_answer, correct_answer)
+        
+        if is_correct:
+            # Правильный ответ, даже если время истекло
+            keyboard = [
+                [InlineKeyboardButton("🎲 Новый вопрос", callback_data="new_question")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+            ]
+            
+            try:
+                # Увеличиваем счет (даже после истечения времени)
+                increment_score(user_id, name)
+                logging.info(f"Score incremented for late but correct answer from user {user_id}")
+                
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"✅ ПРАВИЛЬНО! Хотя время истекло, очко вам засчитано!\n\n📝 Ответ: {correct_answer}\n💬 {comment}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception as e:
+                logging.error(f"Failed to send late correct answer message: {e}")
+                
+        else:
+            # Неправильный ответ после истечения времени
+            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Неверно. Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception as e:
+                logging.error(f"Failed to send wrong answer after expiration message: {e}")
+                
+        return
+    
+    # 5. Отменяем таймер, так как получен ответ
     try:
         if session.get("timer_task") and not session.get("timer_task").done():
             session["timer_task"].cancel()
@@ -346,133 +389,48 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Failed to cancel timer: {e}")
     
-    # 4. Get answer details
-    q = session["q"]
-    correct_answer = q.get("answer", "")
-    comment = q.get("comment") or "Без комментария."
-    question_text = q.get("question", "")
-    
-    # 5. Check answer
+    # 6. Проверяем правильность ответа
     logging.info(f"Checking answer: '{user_answer}' against correct: '{correct_answer}'")
-
-    # Normalize for comparison
+    
+    # Нормализуем ответы для сравнения
     user_clean = normalize_answer(user_answer)
     correct_clean = normalize_answer(correct_answer)
     
     logging.info(f"ANSWER CHECK - User: '{user_clean}' vs Correct: '{correct_clean}'")
     
-    # Direct comparison first
-    is_correct = (user_clean == correct_clean) or (user_clean in correct_clean) or (correct_clean in user_clean)
+    # Проверяем ответ с помощью всех доступных методов
+    is_correct = check_answer(user_answer, correct_answer)
     
-    if not is_correct:
-        is_correct = check_answer(user_answer, correct_answer)
-    else:
-        logging.info("✓ MATCH: Direct comparison successful")
-
-    # 6. Process result with TRIPLE redundancy for correct answers
+    # 7. Обрабатываем результат
     if is_correct:
-        # Set flags first
+        # Отмечаем вопрос как отвеченный правильно
         user_sessions[user_id]["answered"] = True
         user_sessions[user_id]["correct_answer"] = True
         
-        # Update score
+        # Увеличиваем счет
         try:
             increment_score(user_id, name)
             logging.info(f"Score incremented for user {user_id}")
         except Exception as e:
             logging.error(f"Failed to increment score: {e}")
         
-        # Create keyboard with buttons
+        # Отправляем сообщение о правильном ответе
         keyboard = [
             [InlineKeyboardButton("🎲 Новый вопрос", callback_data="new_question")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
         ]
         
-        success = False
-        error_messages = []
-        
-        # METHOD 1: Direct text reply to original message
-        if not success:
-            try:
-                await update.message.reply_text(
-                    f"✅✅✅ ПРАВИЛЬНО! ВЫ ОТВЕТИЛИ ВЕРНО! ✅✅✅\n\n📝 Ответ: {correct_answer}\n💬 {comment}",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                logging.info("SUCCESS: Sent correct answer notification via reply_text")
-                success = True
-            except Exception as e:
-                error_messages.append(f"Method 1 failed: {str(e)}")
-                logging.error(f"Failed method 1: {e}")
-        
-        # METHOD 2: Context bot send_message
-        if not success:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"✅✅✅ ПРАВИЛЬНО! ВЫ ОТВЕТИЛИ ВЕРНО! ✅✅✅\n\n📝 Ответ: {correct_answer}\n💬 {comment}",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                logging.info("SUCCESS: Sent correct answer notification via send_message")
-                success = True
-            except Exception as e:
-                error_messages.append(f"Method 2 failed: {str(e)}")
-                logging.error(f"Failed method 2: {e}")
-        
-        # METHOD 3: Simplest possible message
-        if not success:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="✅ ПРАВИЛЬНО!"
-                )
-                logging.info("SUCCESS: Sent simple correct notification")
-                success = True
-            except Exception as e:
-                error_messages.append(f"Method 3 failed: {str(e)}")
-                logging.error(f"Failed method 3: {e}")
-                
-        # METHOD 4: Last resort - try with ParseMode.MARKDOWN
-        if not success:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="*✅ ПРАВИЛЬНО!*",
-                    parse_mode="Markdown"
-                )
-                logging.info("SUCCESS: Sent markdown correct notification")
-                success = True
-            except Exception as e:
-                error_messages.append(f"Method 4 failed: {str(e)}")
-                logging.error(f"Failed all message methods: {e}")
-                
-        # Log the results of our attempts
-        if success:
-            logging.info(f"Successfully sent correct answer notification to user {user_id}")
-        else:
-            logging.error(f"CRITICAL: All notification methods failed: {error_messages}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ ПРАВИЛЬНО! Верный ответ.\n\n📝 Ответ: {correct_answer}\n💬 {comment}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     else:
-        # Incorrect answer handling
-        if session.get("answered", False) and not session.get("correct_answer", False):
-            # Timer already expired, show answer button
-            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
-            
-            try:
-                await update.message.reply_text(
-                    text="❌ Неверно. Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="❌ Неверно. Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-        else:
-            # Try to tell user their answer is incorrect
-            try:
-                await update.message.reply_text("❌ Неверно, попробуйте еще раз!")
-            except Exception:
-                await context.bot.send_message(chat_id=chat_id, text="❌ Неверно, попробуйте еще раз!")
+        # Неправильный ответ, время не истекло
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Неверно, попробуйте еще раз!"
+        )
 
 def check_answer(user_answer, correct_answer):
     """
