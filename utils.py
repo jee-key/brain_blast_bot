@@ -56,7 +56,10 @@ async def start_timer(chat_id, context, user_id, q, mode):
     current_task = asyncio.current_task()
     user_sessions[user_id]["timer_task"] = current_task
     
-    # *** CRITICAL FIX: Add a flag to track if timer expired ***
+    # Add input_processing flag to prevent race conditions
+    user_sessions[user_id]["input_processing"] = False
+    
+    # Reset timer_expired flag
     user_sessions[user_id]["timer_expired"] = False
 
     try:
@@ -98,8 +101,8 @@ async def start_timer(chat_id, context, user_id, q, mode):
                 return
                 
             session = user_sessions.get(user_id, {})
-            if session.get("answered") or session.get("correct_answer"):
-                logging.info(f"[timer] User {user_id} answered during reading time")
+            if session.get("answered") or session.get("correct_answer") or session.get("input_processing"):
+                logging.info(f"[timer] User {user_id} answered or is processing input during reading time")
                 return
 
         # Another check before sending timer start message
@@ -107,7 +110,7 @@ async def start_timer(chat_id, context, user_id, q, mode):
             return
             
         session = user_sessions.get(user_id, {})
-        if session.get("answered") or session.get("correct_answer"):
+        if session.get("answered") or session.get("correct_answer") or session.get("input_processing"):
             return
 
         # Send timer start message
@@ -131,14 +134,31 @@ async def start_timer(chat_id, context, user_id, q, mode):
                 return
                 
             session = user_sessions.get(user_id, {})
-            # *** CRITICAL FIX: Add check for timer_expired flag ***
+            
+            # Check if an answer is being processed or has been processed
             if session.get("timer_expired"):
-                logging.info(f"[timer] Timer already expired and handled for user {user_id}")
+                logging.info(f"[timer] Timer already expired for user {user_id}")
                 return
                 
             if session.get("answered") or session.get("correct_answer"):
                 logging.info(f"[timer] User {user_id} answered during answer time, stopping timer")
                 return
+                
+            # CRITICAL: Check if user is currently typing/sending an answer
+            if session.get("input_processing"):
+                logging.info(f"[timer] User {user_id} input processing detected, halting timer")
+                # Wait a bit to let the input processing complete
+                await asyncio.sleep(2)
+                # Check again after waiting
+                if user_id not in user_sessions:
+                    return
+                session = user_sessions.get(user_id, {})
+                if session.get("answered") or session.get("correct_answer"):
+                    logging.info(f"[timer] Input was processed successfully, stopping timer")
+                    return
+                # Reset the flag as it may have been a false detection
+                if session.get("input_processing"):
+                    session["input_processing"] = False
                 
             # Send hint at halfway point if enabled for this mode
             if config["show_hint"] and i == config["hint_time"] and ENABLE_HINTS:
@@ -147,7 +167,7 @@ async def start_timer(chat_id, context, user_id, q, mode):
                     return
                     
                 session = user_sessions.get(user_id, {})
-                if session.get("answered") or session.get("correct_answer"):
+                if session.get("answered") or session.get("correct_answer") or session.get("input_processing"):
                     return
                 
                 answer = q.get("answer", "")
@@ -167,33 +187,64 @@ async def start_timer(chat_id, context, user_id, q, mode):
             return
             
         session = user_sessions.get(user_id, {})
+        
+        # Give one final small delay to check for any last-moment answers
+        # This delay is crucial for preventing race conditions
+        if session.get("input_processing"):
+            logging.info(f"[timer] Last-second input detected, giving extra time")
+            await asyncio.sleep(1.5)
+            
+            # Check one last time after the delay
+            if user_id not in user_sessions:
+                return
+                
+            session = user_sessions.get(user_id, {})
+            if session.get("answered") or session.get("correct_answer"):
+                logging.info(f"[timer] Input was processed during final delay, stopping timer")
+                return
+        
+        # Check once more if user already answered
         if session.get("answered") or session.get("correct_answer"):
             logging.info(f"[timer] User {user_id} answered at the last moment")
             return
-            
-        # *** CRITICAL FIX: Set timer_expired flag first ***
+        
+        # CRITICAL: Set flags in a careful order with logging
         if user_id in user_sessions:
-            user_sessions[user_id]["timer_expired"] = True
-            logging.info(f"[timer] Setting timer_expired flag for user {user_id}")
-
-        # Mark as answered to prevent duplicate answers
-        if user_id in user_sessions:
-            user_sessions[user_id]["answered"] = True
-            logging.info(f"[timer] Time's up for user {user_id}, marking as answered")
-
-        # Send time's up message with answer reveal button
-        keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
-        try:
-            await context.bot.send_message(
-                chat_id, 
-                "⏰ Время вышло!", 
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            logging.info(f"[timer] Sent time's up message to user {user_id}")
-        except Exception as e:
-            logging.error(f"[timer] Error sending time's up message: {e}")
+            # Only proceed if we're certain no input is being processed
+            if not session.get("input_processing"):
+                # First set timer_expired flag 
+                user_sessions[user_id]["timer_expired"] = True
+                logging.info(f"[timer] Setting timer_expired flag for user {user_id}")
+                
+                # For safety, add a tiny delay between flag settings
+                await asyncio.sleep(0.1)
+                
+                # Then mark as answered
+                user_sessions[user_id]["answered"] = True
+                logging.info(f"[timer] Time's up for user {user_id}, marking as answered")
+                
+                # Send time's up message with answer reveal button
+                keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
+                try:
+                    await context.bot.send_message(
+                        chat_id, 
+                        "⏰ Время вышло!", 
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                    logging.info(f"[timer] Sent time's up message to user {user_id}")
+                except Exception as e:
+                    logging.error(f"[timer] Error sending time's up message: {e}")
+            else:
+                logging.info(f"[timer] Cannot expire timer - input processing in progress")
     except asyncio.CancelledError:
         logging.info(f"[timer] Timer for user {user_id} was cancelled (answer received)")
+        
+        # Cleanup flags in case of cancellation
+        if user_id in user_sessions:
+            # Ensure the timer_expired flag is NOT set when cancelled
+            user_sessions[user_id]["timer_expired"] = False
+            logging.info(f"[timer] Reset timer_expired flag due to cancellation")
+            
         return
     except Exception as e:
         logging.error(f"[timer] Timer error: {e}", exc_info=True)

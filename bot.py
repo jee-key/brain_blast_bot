@@ -596,7 +596,8 @@ async def stop_drift(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Completely redesigned message handler with priority answer processing
+    Completely redesigned message handler with priority answer processing and
+    improved race condition handling
     """
     user_id = update.message.from_user.id
     message_text = update.message.text.strip()
@@ -604,60 +605,88 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"🔍 INCOMING MESSAGE from user {user_id}: '{message_text}'")
     
-    # КРИТИЧЕСКИ ВАЖНО: Немедленно проверяем и останавливаем таймер при любом сообщении
+    # STEP 1: Set input_processing flag FIRST to block timer expiration
     session = user_sessions.get(user_id, {})
+    if session:
+        session["input_processing"] = True
+        logging.info(f"⚠️ [SYNC] Set input_processing flag for user {user_id}")
+        
+    # STEP 2: Try to cancel any running timer - but continue even if it fails
     if session and session.get("timer_task") and not session.get("timer_task").done():
         try:
-            # Сразу останавливаем таймер
+            # Immediately try to cancel timer
             session["timer_task"].cancel()
-            logging.info(f"⚠️ [URGENT] Timer immediately cancelled on message from user {user_id}")
-            
-            # Добавляем небольшую паузу, чтобы убедиться, что таймер полностью остановлен
-            await asyncio.sleep(0.3)
+            logging.info(f"⚠️ [SYNC] Timer cancelled for user {user_id}")
+            # Small delay to ensure cancellation completes
+            await asyncio.sleep(0.5)
         except Exception as e:
             logging.error(f"Failed to cancel timer during immediate check: {e}")
     
-    # Check if user is in drift mode
-    if user_modes.get(user_id) == "drift" and user_id in drift_sessions:
-        # If in drift mode, check for stop commands first
-        if message_text.startswith('/'):
-            # If user types /stop, this is handled by the stop_drift command handler
-            # If user types /start, we should also exit drift mode
-            if message_text.startswith('/start'):
-                # Get the chain before stopping
-                chain = stop_drift_session(user_id)
-                
-                # Format the chain and show completion message with options
-                formatted_chain = ' → '.join(chain)
-                
-                keyboard = [
-                    [InlineKeyboardButton("🎮 Выбрать режим", callback_data="choose_mode")],
-                    [InlineKeyboardButton("🎲 Новый вопрос", callback_data="new_question")]
-                ]
-                
-                await update.message.reply_text(
-                    f"🏁 Сессия ассоциативного дрифта завершена командой /start\n\n"
-                    f"Цепочка ассоциаций:\n*{formatted_chain}*\n\n"
-                    f"Что хотите делать дальше?",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown"
-                )
-                return
-            # For other commands, let them be handled by command handlers
-            return
-            
-        # Process the user's association and get the bot's response
-        next_word = add_association(user_id, message_text)
-        
-        # Send the next association
-        await update.message.reply_text(
-            f"👉 *{next_word}*",
-            parse_mode="Markdown"
-        )
-        return
+    # STEP 3: Check if timer has already expired
+    if session and session.get("timer_expired"):
+        # Reset the input processing flag since we won't be changing anything
+        session["input_processing"] = False
+        logging.info(f"⚠️ [SYNC] Timer already expired for user {user_id}, won't interrupt")
     
-    # Otherwise, handle as a CHGK quiz answer - with high priority processing
-    await process_answer_with_priority(update, context)
+    # STEP 4: Process message based on mode
+    try:
+        # Check if user is in drift mode
+        if user_modes.get(user_id) == "drift" and user_id in drift_sessions:
+            # If in drift mode, check for stop commands first
+            if message_text.startswith('/'):
+                # Reset input processing flag since we're done with special processing
+                if session:
+                    session["input_processing"] = False
+                
+                # If user types /stop, this is handled by the stop_drift command handler
+                # If user types /start, we should also exit drift mode
+                if message_text.startswith('/start'):
+                    # Get the chain before stopping
+                    chain = stop_drift_session(user_id)
+                    
+                    # Format the chain and show completion message with options
+                    formatted_chain = ' → '.join(chain)
+                    
+                    keyboard = [
+                        [InlineKeyboardButton("🎮 Выбрать режим", callback_data="choose_mode")],
+                        [InlineKeyboardButton("🎲 Новый вопрос", callback_data="new_question")]
+                    ]
+                    
+                    await update.message.reply_text(
+                        f"🏁 Сессия ассоциативного дрифта завершена командой /start\n\n"
+                        f"Цепочка ассоциаций:\n*{formatted_chain}*\n\n"
+                        f"Что хотите делать дальше?",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode="Markdown"
+                    )
+                    return
+                # For other commands, let them be handled by command handlers
+                return
+                
+            # Process the user's association and get the bot's response
+            next_word = add_association(user_id, message_text)
+            
+            # Reset input processing flag since we're done with special processing
+            if session:
+                session["input_processing"] = False
+                
+            # Send the next association
+            await update.message.reply_text(
+                f"👉 *{next_word}*",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Otherwise, handle as a CHGK quiz answer - with high priority processing
+        await process_answer_with_priority(update, context)
+    finally:
+        # STEP 5: Always reset the input_processing flag when done
+        # This is in a finally block to ensure it happens regardless of exceptions
+        if user_id in user_sessions:
+            user_sessions[user_id]["input_processing"] = False
+            logging.info(f"⚠️ [SYNC] Reset input_processing flag for user {user_id}")
+        else:
+            logging.info(f"⚠️ [SYNC] Cannot reset input_processing - session not found for user {user_id}")
 
 async def process_answer_with_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
