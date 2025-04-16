@@ -2,9 +2,13 @@ import asyncio
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 import re
 import logging
+import os
 
 # Global variable shared with bot.py
 user_sessions = {}
+
+# Get environment variable for hints
+ENABLE_HINTS = os.getenv("ENABLE_HINTS", "true").lower() == "true"
 
 # Add normalize_answer function for consistent answer processing
 def normalize_answer(text):

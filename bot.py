@@ -274,18 +274,21 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logging.info(f"Active session found for user {user_id}, answered: {session.get('answered', False)}")
     
-    if session.get("answered", False):
-        await update.message.reply_text("⏳ Твой ответ уже принят, дождитесь следующего вопроса.")
+    if session.get("answered", False) and session.get("correct_answer", False):
+        await update.message.reply_text("✅ Вы уже ответили верно на этот вопрос.")
         return
-
-    # Mark the question as answered immediately 
-    user_sessions[user_id]["answered"] = True
-    
+    elif session.get("answered", False):
+        # If they answered but it wasn't correct, let them try again
+        logging.info(f"User {user_id} already answered incorrectly, letting them try again")
+        
     # Cancel the timer immediately to prevent "Time's up!" message
     if session.get("timer_task") and not session.get("timer_task").done():
         logging.info(f"Canceling timer for user {user_id}")
-        session["timer_task"].cancel()
-        session["timer_task"] = None
+        try:
+            session["timer_task"].cancel()
+            session["timer_task"] = None
+        except Exception as e:
+            logging.error(f"Error canceling timer: {e}")
 
     # Process the answer
     try:
@@ -390,26 +393,53 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Provide feedback to the user
         if is_correct:
+            # Mark as correctly answered
+            user_sessions[user_id]["answered"] = True
             user_sessions[user_id]["correct_answer"] = True
+            
+            # Increment score
             increment_score(user_id, name)
             logging.info(f"Incremented score for user {user_id} ({name})")
+            
+            # Prepare response with comment if available
             comment = session["q"].get("comment") or "Без комментария."
-            await update.message.reply_text(
-                f"✅ Правильно! Вы ответили верно.\n\n"
-                f"📝 Ответ: {original_correct_answer}\n"
-                f"💬 {comment}"
-            )
+            
+            # Send confirmation message
+            try:
+                await update.message.reply_text(
+                    f"✅ Правильно! Вы ответили верно.\n\n"
+                    f"📝 Ответ: {original_correct_answer}\n"
+                    f"💬 {comment}"
+                )
+                logging.info(f"Sent correct answer confirmation to user {user_id}")
+            except Exception as e:
+                logging.error(f"Failed to send correct answer message: {e}", exc_info=True)
+                # Try again with a simpler message
+                try:
+                    await update.message.reply_text("✅ Правильно!")
+                except:
+                    logging.error("Failed to send even simple confirmation message")
         else:
             logging.info(f"Answer is incorrect for user {user_id}")
-            await update.message.reply_text("❌ Неверно, попробуйте еще раз!")
             # Allow answering again for incorrect answers
             user_sessions[user_id]["answered"] = False
             
+            try:
+                await update.message.reply_text("❌ Неверно, попробуйте еще раз!")
+                logging.info(f"Sent incorrect answer message to user {user_id}")
+            except Exception as e:
+                logging.error(f"Failed to send incorrect answer message: {e}", exc_info=True)
+            
     except Exception as e:
         logging.error(f"Error processing answer: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ Произошла ошибка при обработке ответа. Попробуйте еще раз или запросите новый вопрос.")
         # Reset answer state on error
-        user_sessions[user_id]["answered"] = False
+        if user_id in user_sessions:
+            user_sessions[user_id]["answered"] = False
+        
+        try:
+            await update.message.reply_text("⚠️ Произошла ошибка при обработке ответа. Попробуйте еще раз или запросите новый вопрос.")
+        except Exception as msg_error:
+            logging.error(f"Failed to send error message: {msg_error}")
 
 def get_small_hint(answer):
     """Provides a small hint about the answer without giving too much away"""
