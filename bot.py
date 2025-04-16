@@ -300,123 +300,118 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Enhanced answer handler that fixes all response issues
+    Completely rewritten answer handler with minimal complexity
     """
-    # Get user information and message
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
     user_answer = update.message.text.strip()
     chat_id = update.message.chat_id
     
-    logging.info(f"⚡ NEW ANSWER: User {user_id} ({name}) submitted: '{user_answer}'")
+    logging.info(f"ANSWER RECEIVED from user {user_id}: '{user_answer}'")
     
-    # Check if user has an active question session
+    # Step 1: Check if user has an active session
     session = user_sessions.get(user_id)
     if not session or "q" not in session:
-        logging.error(f"No active question session for user {user_id}")
         await context.bot.send_message(
             chat_id=chat_id,
-            text="🤔 У вас сейчас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать."
+            text="У вас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать."
         )
         return
     
-    # Check if the user already answered correctly
+    # Step 2: Check if already answered correctly
     if session.get("correct_answer", False):
-        logging.info(f"User {user_id} already answered correctly")
         await context.bot.send_message(
             chat_id=chat_id,
-            text="✅ Вы уже ответили верно на этот вопрос."
+            text="Вы уже ответили верно на этот вопрос."
         )
         return
     
-    # Send immediate acknowledgment message before we do any processing
-    ack_message = await context.bot.send_message(
-        chat_id=chat_id,
-        text="⏳ Твой ответ принят и обрабатывается..."
-    )
-    logging.info(f"Sent acknowledgment message to user {user_id}")
-
-    # Cancel timer task IMMEDIATELY to prevent "Time's up" message
-    if session.get("timer_task") and not session.get("timer_task").done():
-        try:
+    # Step 3: Send immediate acknowledgment
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏳ Твой ответ принят и обрабатывается..."
+        )
+    except Exception as e:
+        logging.error(f"Failed to send acknowledgment: {e}")
+    
+    # Step 4: Immediately cancel timer if it exists
+    try:
+        if session.get("timer_task") and not session.get("timer_task").done():
             session["timer_task"].cancel()
             session["timer_task"] = None
             logging.info(f"Timer cancelled for user {user_id}")
-        except Exception as e:
-            logging.error(f"Failed to cancel timer: e")
+    except Exception as e:
+        logging.error(f"Failed to cancel timer: {e}")
     
-    # Get the correct answer
+    # Step 5: Check answer correctness
     correct_answer = session["q"].get("answer", "")
-    if not correct_answer:
-        logging.error(f"No correct answer found in question data for user {user_id}")
-        return
-        
-    logging.info(f"Comparing user answer '{user_answer}' with correct answer '{correct_answer}'")
+    comment = session["q"].get("comment") or "Без комментария."
     
-    # Check if answer is correct using various methods
-    is_correct = False
-    clean_user = normalize_answer(user_answer)
-    clean_correct = normalize_answer(correct_answer)
+    is_correct = check_answer(user_answer, correct_answer)
     
-    # Different matching strategies
-    if clean_user == clean_correct:
-        is_correct = True
-        logging.info("MATCH: Exact match after normalization")
-    elif clean_user in clean_correct or clean_correct in clean_user:
-        is_correct = True
-        logging.info("MATCH: One contains the other")
-    elif len(clean_user) > 3 and len(clean_correct) > 3 and (clean_user in clean_correct or clean_correct in clean_user):
-        is_correct = True
-        logging.info("MATCH: Partial match for longer answers")
-    
-    # Process the result
+    # Step 6: Process result
     if is_correct:
-        # Mark as correctly answered and update score
+        # Mark as correctly answered
         user_sessions[user_id]["answered"] = True
         user_sessions[user_id]["correct_answer"] = True
         
         # Update user score
-        increment_score(user_id, name)
-        
-        # Get comment if available
-        comment = session["q"].get("comment") or "Без комментария."
-        
-        # Send confirmation message
-        response_text = f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}"
-        
         try:
-            # Send direct message using context.bot
-            sent = await context.bot.send_message(
-                chat_id=chat_id,
-                text=response_text
-            )
-            logging.info(f"✅ SENT correct answer confirmation to user {user_id}")
-            
-            # Double-check if message was sent
-            if not sent:
-                logging.warning(f"Message not sent despite no exception")
-                # Try simple message as fallback
-                await context.bot.send_message(chat_id=chat_id, text="✅ Правильно!")
-                
+            increment_score(user_id, name)
         except Exception as e:
-            logging.error(f"❌ ERROR sending correct answer confirmation: {e}")
-            # Try with a simpler message
-            try:
-                await context.bot.send_message(chat_id=chat_id, text="✅ Правильно!")
-            except Exception as e2:
-                logging.error(f"❌ ERROR sending even simple message: {e2}")
+            logging.error(f"Failed to increment score: {e}")
+        
+        # Send correct answer confirmation
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}"
+        )
     else:
-        # Allow retry for incorrect answers
+        # Allow another attempt
         user_sessions[user_id]["answered"] = False
         
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="❌ Неверно, попробуйте еще раз!"
-            )
-            logging.info(f"Sent incorrect message to user {user_id}")
-        except Exception as e:
-            logging.error(f"Error sending incorrect message: {e}")
+        # Send incorrect answer notification
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Неверно, попробуйте еще раз!"
+        )
+
+def check_answer(user_answer, correct_answer):
+    """
+    Simplified answer checking logic
+    """
+    if not user_answer or not correct_answer:
+        return False
+        
+    user_clean = normalize_answer(user_answer)
+    correct_clean = normalize_answer(correct_answer)
+    
+    # Log the comparison
+    logging.info(f"Comparing: '{user_clean}' with '{correct_clean}'")
+    
+    # Check exact match after normalization
+    if user_clean == correct_clean:
+        logging.info("MATCH: Exact match after normalization")
+        return True
+    
+    # Check if one contains the other
+    if user_clean in correct_clean or correct_clean in user_clean:
+        logging.info("MATCH: One contains the other")
+        return True
+        
+    # Check raw match
+    if user_answer.lower() == correct_answer.lower():
+        logging.info("MATCH: Raw lowercase match")
+        return True
+    
+    # Check partial match for longer answers
+    if len(user_clean) > 3 and len(correct_clean) > 3:
+        if user_clean in correct_clean or correct_clean in user_clean:
+            logging.info("MATCH: Partial match for longer answers")
+            return True
+    
+    return False
 
 def get_small_hint(answer):
     """Provides a small hint about the answer without giving too much away"""
