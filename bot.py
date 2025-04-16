@@ -597,7 +597,7 @@ async def stop_drift(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Completely redesigned message handler with priority answer processing and
-    improved race condition handling
+    improved race condition handling for last-second answers
     """
     user_id = update.message.from_user.id
     message_text = update.message.text.strip()
@@ -617,16 +617,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Immediately try to cancel timer
             session["timer_task"].cancel()
             logging.info(f"⚠️ [SYNC] Timer cancelled for user {user_id}")
-            # Small delay to ensure cancellation completes
-            await asyncio.sleep(0.5)
+            # IMPORTANT: Give a bit more time for cancellation to fully process
+            await asyncio.sleep(1.0)
         except Exception as e:
             logging.error(f"Failed to cancel timer during immediate check: {e}")
     
-    # STEP 3: Check if timer has already expired
-    if session and session.get("timer_expired"):
-        # Reset the input processing flag since we won't be changing anything
-        session["input_processing"] = False
-        logging.info(f"⚠️ [SYNC] Timer already expired for user {user_id}, won't interrupt")
+    # STEP 3: Force reset timer_expired flag if we're processing a message
+    # This is critical for race condition cases where timer just expired
+    if session and session.get("timer_expired") and not session.get("answered", False):
+        # If timer expired but answer hasn't been processed yet, override it
+        logging.info(f"⚠️ [SYNC] CRITICAL: Detected last-millisecond answer after timer expiration!")
+        session["timer_expired"] = False
+        # Cancel any scheduled answer reveal
+        if session.get("timer_task"):
+            try:
+                session["timer_task"].cancel()
+                logging.info(f"⚠️ [SYNC] Cancelled scheduled answer reveal")
+            except Exception as e:
+                logging.error(f"Failed to cancel scheduled answer reveal: {e}")
     
     # STEP 4: Process message based on mode
     try:
@@ -678,6 +686,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Otherwise, handle as a CHGK quiz answer - with high priority processing
+        # Force prioritized answer processing regardless of timer state
         await process_answer_with_priority(update, context)
     finally:
         # STEP 5: Always reset the input_processing flag when done

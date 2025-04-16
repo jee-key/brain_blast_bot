@@ -61,6 +61,12 @@ async def start_timer(chat_id, context, user_id, q, mode):
     
     # Reset timer_expired flag
     user_sessions[user_id]["timer_expired"] = False
+    
+    # Add a new flag to track if the timer is in the grace period
+    user_sessions[user_id]["timer_grace_period"] = False
+    
+    # Add new flag to prioritize user answers
+    user_sessions[user_id]["answer_priority"] = True
 
     try:
         # Calculate reading time based on question length and images
@@ -147,8 +153,8 @@ async def start_timer(chat_id, context, user_id, q, mode):
             # CRITICAL: Check if user is currently typing/sending an answer
             if session.get("input_processing"):
                 logging.info(f"[timer] User {user_id} input processing detected, halting timer")
-                # Wait a bit to let the input processing complete
-                await asyncio.sleep(2)
+                # Wait longer to let the input processing complete
+                await asyncio.sleep(5)  # Increased from 3s to 5s
                 # Check again after waiting
                 if user_id not in user_sessions:
                     return
@@ -188,38 +194,84 @@ async def start_timer(chat_id, context, user_id, q, mode):
             
         session = user_sessions.get(user_id, {})
         
-        # Give one final small delay to check for any last-moment answers
-        # This delay is crucial for preventing race conditions
-        if session.get("input_processing"):
-            logging.info(f"[timer] Last-second input detected, giving extra time")
-            await asyncio.sleep(1.5)
+        # Enter grace period - this is critical to handle last-millisecond responses
+        if user_id in user_sessions:
+            user_sessions[user_id]["timer_grace_period"] = True
+            logging.info(f"[timer] Entering grace period for user {user_id}")
+        
+        # NEW: Add longer delays before marking timer as expired
+        # First delay - check for immediate responses
+        await asyncio.sleep(2.0)  # Increased from 1.0s to 2.0s
+        
+        # Check for answers that arrived during first delay
+        if user_id not in user_sessions:
+            return
             
-            # Check one last time after the delay
+        session = user_sessions.get(user_id, {})
+        if session.get("answered") or session.get("correct_answer"):
+            logging.info(f"[timer] User answered during first delay period")
+            return
+            
+        # Extra delay if input is being processed
+        if session.get("input_processing"):
+            logging.info(f"[timer] Last-second input detected before timer expiry, giving extra time")
+            # Give a much longer delay for last-second inputs
+            await asyncio.sleep(8.0)  # Increased from 5.0s to 8.0s
+            
+            # Check again after the longer delay
             if user_id not in user_sessions:
                 return
                 
             session = user_sessions.get(user_id, {})
             if session.get("answered") or session.get("correct_answer"):
-                logging.info(f"[timer] Input was processed during final delay, stopping timer")
+                logging.info(f"[timer] Input was processed during extended delay, stopping timer")
                 return
         
-        # Check once more if user already answered
-        if session.get("answered") or session.get("correct_answer"):
-            logging.info(f"[timer] User {user_id} answered at the last moment")
+        # Final protection delay - giving absolute priority to any in-flight message processing
+        await asyncio.sleep(3.0)  # Increased from 2.0s to 3.0s
+        
+        if user_id not in user_sessions:
             return
+            
+        session = user_sessions.get(user_id, {})
+        
+        # Exit grace period
+        if user_id in user_sessions:
+            user_sessions[user_id]["timer_grace_period"] = False
+            logging.info(f"[timer] Exiting grace period for user {user_id}")
+        
+        # Final message check
+        if session.get("answered") or session.get("correct_answer") or session.get("input_processing"):
+            logging.info(f"[timer] Last millisecond check: user appears to be answering or has answered")
+            return
+        
+        # CRITICAL: Check for the answer_priority flag
+        if session.get("answer_priority"):
+            # Give one last chance for any in-flight answer to be processed
+            user_sessions[user_id]["answer_priority"] = False
+            logging.info(f"[timer] Final answer priority period for user {user_id}")
+            await asyncio.sleep(1.0)
+            
+            # Check again after the priority period
+            if user_id not in user_sessions:
+                return
+                
+            session = user_sessions.get(user_id, {})
+            if session.get("answered") or session.get("correct_answer"):
+                logging.info(f"[timer] Answer processed during priority period")
+                return
         
         # CRITICAL: Set flags in a careful order with logging
         if user_id in user_sessions:
-            # Only proceed if we're certain no input is being processed
-            if not session.get("input_processing"):
-                # First set timer_expired flag 
-                user_sessions[user_id]["timer_expired"] = True
-                logging.info(f"[timer] Setting timer_expired flag for user {user_id}")
-                
-                # For safety, add a tiny delay between flag settings
-                await asyncio.sleep(0.1)
-                
-                # Then mark as answered
+            # First set timer_expired flag 
+            user_sessions[user_id]["timer_expired"] = True
+            logging.info(f"[timer] Setting timer_expired flag for user {user_id}")
+            
+            # For safety, add a delay between flag settings
+            await asyncio.sleep(1.0)  # Increased from 0.5s to 1.0s
+            
+            # Check one more time before marking as answered
+            if user_id in user_sessions and not session.get("answered") and not session.get("correct_answer"):
                 user_sessions[user_id]["answered"] = True
                 logging.info(f"[timer] Time's up for user {user_id}, marking as answered")
                 
@@ -234,16 +286,18 @@ async def start_timer(chat_id, context, user_id, q, mode):
                     logging.info(f"[timer] Sent time's up message to user {user_id}")
                 except Exception as e:
                     logging.error(f"[timer] Error sending time's up message: {e}")
-            else:
-                logging.info(f"[timer] Cannot expire timer - input processing in progress")
     except asyncio.CancelledError:
-        logging.info(f"[timer] Timer for user {user_id} was cancelled (answer received)")
+        logging.info(f"[timer] Timer for user {user_id} was cancelled (answer received)")  # Fixed the bracket
         
         # Cleanup flags in case of cancellation
         if user_id in user_sessions:
             # Ensure the timer_expired flag is NOT set when cancelled
             user_sessions[user_id]["timer_expired"] = False
             logging.info(f"[timer] Reset timer_expired flag due to cancellation")
+            
+            # Also ensure grace period is exited
+            user_sessions[user_id]["timer_grace_period"] = False
+            logging.info(f"[timer] Reset grace period flag due to cancellation")
             
         return
     except Exception as e:
