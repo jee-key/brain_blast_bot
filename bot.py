@@ -595,11 +595,26 @@ async def stop_drift(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Main message handler that routes messages to either the CHGK answer handler
-    or the associative drift handler based on the user's current mode
+    Completely redesigned message handler with priority answer processing
     """
     user_id = update.message.from_user.id
     message_text = update.message.text.strip()
+    chat_id = update.message.chat_id
+    
+    logging.info(f"🔍 INCOMING MESSAGE from user {user_id}: '{message_text}'")
+    
+    # КРИТИЧЕСКИ ВАЖНО: Немедленно проверяем и останавливаем таймер при любом сообщении
+    session = user_sessions.get(user_id, {})
+    if session and session.get("timer_task") and not session.get("timer_task").done():
+        try:
+            # Сразу останавливаем таймер
+            session["timer_task"].cancel()
+            logging.info(f"⚠️ [URGENT] Timer immediately cancelled on message from user {user_id}")
+            
+            # Добавляем небольшую паузу, чтобы убедиться, что таймер полностью остановлен
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logging.error(f"Failed to cancel timer during immediate check: {e}")
     
     # Check if user is in drift mode
     if user_modes.get(user_id) == "drift" and user_id in drift_sessions:
@@ -640,8 +655,83 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Otherwise, handle as a CHGK quiz answer
-    await handle_answer(update, context)
+    # Otherwise, handle as a CHGK quiz answer - with high priority processing
+    await process_answer_with_priority(update, context)
+
+async def process_answer_with_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Высокоприоритетный обработчик ответов, вызывается после отмены таймера
+    """
+    user_id = update.message.from_user.id
+    name = update.message.from_user.full_name
+    user_answer = update.message.text.strip()
+    chat_id = update.message.chat_id
+    
+    # 1. Проверяем наличие активного вопроса (повторно, для уверенности)
+    session = user_sessions.get(user_id)
+    if not session or "q" not in session:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="У вас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать."
+        )
+        return
+    
+    # 2. Отправляем сообщение о проверке
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="⏳ Проверяю ваш ответ...")
+    except Exception as e:
+        logging.error(f"Failed to send acknowledgment: {e}")
+    
+    # 3. Получаем данные вопроса
+    q = session["q"]
+    correct_answer = q.get("answer", "")
+    comment = q.get("comment") or "Без комментария."
+    
+    # 4. Проверяем правильность ответа
+    is_correct = check_answer(user_answer, correct_answer)
+    logging.info(f"Priority answer check result: {is_correct} for user {user_id}")
+    
+    # 5. Обрабатываем результат проверки
+    if is_correct:
+        # Отмечаем вопрос как отвеченный правильно
+        user_sessions[user_id]["answered"] = True
+        user_sessions[user_id]["correct_answer"] = True
+        
+        # Увеличиваем счет
+        try:
+            increment_score(user_id, name)
+            logging.info(f"Score incremented for user {user_id}")
+        except Exception as e:
+            logging.error(f"Failed to increment score: {e}")
+        
+        # Отправляем сообщение о правильном ответе
+        keyboard = [
+            [InlineKeyboardButton("🎲 Новый вопрос", callback_data="new_question")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+        ]
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ ПРАВИЛЬНО! Верный ответ.\n\n📝 Ответ: {correct_answer}\n💬 {comment}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        # Проверяем, истек ли таймер к этому моменту
+        if session.get("timer_expired", False):
+            # Если таймер уже истек, показываем кнопку для ответа
+            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Неверно. Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            # Неправильный ответ, время не истекло
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Неверно, попробуйте еще раз!"
+            )
 
 def main():
     """Start the bot."""
@@ -656,6 +746,9 @@ def main():
     application.add_handler(CommandHandler("drift", start_drift))
     application.add_handler(CommandHandler("stop", stop_drift))
     application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # We no longer use the handle_answer function directly
+    # Instead, all messages go through the redesigned handle_message function
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Start the bot
