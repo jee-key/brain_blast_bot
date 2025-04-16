@@ -180,7 +180,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     if query.data.startswith("reveal_answer:"):
         user_id = int(query.data.split(":")[1])
-        logging.info(f"Processing reveal_answer for user {user_id}")
+        logging.info(f"Processing reveal_answer for user {user_id}, pressed by {query.from_user.id}")
+        
+        # Get the chat ID directly from the query
         chat_id = query.message.chat_id
         
         # Get session data
@@ -198,29 +200,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             
             try:
-                # Use context.bot.send_message instead of query.message.reply_text
+                # First try to cancel any active timer for this user
+                if session.get("timer_task") and not session.get("timer_task").done():
+                    try:
+                        session["timer_task"].cancel()
+                        session["timer_task"] = None
+                        logging.info(f"Timer cancelled for user {user_id} when showing answer")
+                    except Exception as e:
+                        logging.error(f"Failed to cancel timer: {e}")
+                
+                # Mark as answered to prevent duplicate answer processing
+                user_sessions[user_id]["answered"] = True
+                
+                # Send answer directly using context.bot instead of query.message.reply_text
+                message_text = f"📝 Ответ: {answer}\n💬 {comment}"
                 await context.bot.send_message(
-                    chat_id,
-                    f"📝 Ответ: {answer}\n💬 {comment}", 
+                    chat_id=chat_id,
+                    text=message_text, 
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-                logging.info(f"Sent answer reveal message to user {user_id}")
+                logging.info(f"✅ Successfully sent answer reveal message to chat {chat_id}")
             except Exception as e:
-                logging.error(f"Error sending reveal answer message: {e}", exc_info=True)
+                logging.error(f"❌ Error sending reveal answer message: {e}", exc_info=True)
                 try:
                     # Try with simpler message if fails
                     await context.bot.send_message(
-                        chat_id,
-                        f"📝 Ответ: {answer}"
+                        chat_id=chat_id,
+                        text=f"📝 Ответ: {answer}"
                     )
+                    logging.info("Sent simplified answer message as fallback")
                 except Exception as e2:
                     logging.error(f"Failed to send even simple answer reveal: {e2}")
         else:
             logging.warning(f"Session not found for user {user_id} in reveal_answer")
             try:
                 await context.bot.send_message(
-                    chat_id,
-                    "⚠️ Не удалось найти информацию о вопросе. Попробуйте запросить новый вопрос."
+                    chat_id=chat_id,
+                    text="⚠️ Не удалось найти информацию о вопросе. Попробуйте запросить новый вопрос."
                 )
             except Exception as e:
                 logging.error(f"Failed to send session not found message: {e}")
@@ -284,27 +300,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Completely rewritten handle_answer function to fix all issues with answer processing
+    Enhanced answer handler that fixes all response issues
     """
-    # Basic info extraction
+    # Get user information and message
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
     user_answer = update.message.text.strip()
     chat_id = update.message.chat_id
     
-    logging.info(f"ANSWER RECEIVED: User {user_id} ({name}) submitted: '{user_answer}'")
+    logging.info(f"⚡ NEW ANSWER: User {user_id} ({name}) submitted: '{user_answer}'")
     
-    # 1. Check if user has an active session
+    # Check if user has an active question session
     session = user_sessions.get(user_id)
     if not session or "q" not in session:
-        logging.error(f"No active session/question for user {user_id}")
+        logging.error(f"No active question session for user {user_id}")
         await context.bot.send_message(
             chat_id=chat_id,
-            text="🤔 У вас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать."
+            text="🤔 У вас сейчас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать."
         )
         return
     
-    # 2. Check if user already answered correctly
+    # Check if the user already answered correctly
     if session.get("correct_answer", False):
         logging.info(f"User {user_id} already answered correctly")
         await context.bot.send_message(
@@ -312,150 +328,95 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="✅ Вы уже ответили верно на этот вопрос."
         )
         return
-        
-    # Get the correct answer from the session
-    correct_answer = session["q"].get("answer", "")
-    if not correct_answer:
-        logging.error(f"No answer found in question for user {user_id}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⚠️ Произошла ошибка: не найден правильный ответ. Попробуйте запросить новый вопрос."
-        )
-        return
-        
-    logging.info(f"Checking user answer: '{user_answer}' against correct: '{correct_answer}'")
     
-    # 3. Process the answer - completely rewritten logic
-    is_correct = False
-    
-    # 3.1 Handle duplex (multi-part) questions
-    if "1." in correct_answer and "2." in correct_answer:
-        logging.info(f"Processing multi-part (duplex) question")
-        
-        # Direct match first
-        if user_answer.lower() == correct_answer.lower():
-            is_correct = True
-            logging.info("CORRECT: Direct match on multi-part question")
-        
-        # If not direct match, try part-by-part matching
-        elif "1." in user_answer and "2." in user_answer:
-            # Extract parts from both answers
-            correct_parts = re.split(r'\d\.', correct_answer.lower())
-            user_parts = re.split(r'\d\.', user_answer.lower()) 
-            
-            # Remove empty parts
-            correct_parts = [p.strip() for p in correct_parts if p.strip()]
-            user_parts = [p.strip() for p in user_parts if p.strip()]
-            
-            # Check if we have the same number of parts
-            if len(correct_parts) == len(user_parts):
-                # Check each part
-                all_parts_match = True
-                for i in range(len(correct_parts)):
-                    c_part = normalize_answer(correct_parts[i])
-                    u_part = normalize_answer(user_parts[i])
-                    
-                    # If any part doesn't match, the answer is wrong
-                    if not (u_part == c_part or u_part in c_part or c_part in u_part):
-                        all_parts_match = False
-                        break
-                
-                if all_parts_match:
-                    is_correct = True
-                    logging.info("CORRECT: All parts of multi-part question match")
-    
-    # 3.2 Handle regular (single) answers
-    else:
-        clean_correct = normalize_answer(correct_answer)
-        clean_user = normalize_answer(user_answer)
-        
-        # Direct normalization match
-        if clean_user == clean_correct:
-            is_correct = True
-            logging.info("CORRECT: Exact normalized match")
-        
-        # One contains the other
-        elif clean_user in clean_correct or clean_correct in clean_user:
-            is_correct = True
-            logging.info("CORRECT: One answer contains the other")
-            
-        # Raw lowercased match
-        elif user_answer.lower() == correct_answer.lower():
-            is_correct = True
-            logging.info("CORRECT: Raw lowercase match")
-            
-        # Keyword matching for multi-word answers
-        elif ' ' in clean_correct and ' ' in clean_user:
-            correct_keywords = set(clean_correct.split())
-            user_keywords = set(clean_user.split())
-            
-            if len(correct_keywords) > 1 and len(user_keywords) > 0:
-                common_words = correct_keywords.intersection(user_keywords)
-                match_percentage = len(common_words) / len(correct_keywords)
-                logging.info(f"Keyword match percentage: {match_percentage:.2f}")
-                
-                if match_percentage >= 0.7:
-                    is_correct = True
-                    logging.info("CORRECT: Keyword match percentage >= 70%")
-        
-        # Check comment for alternative answers
-        if not is_correct:
-            comment = session["q"].get("comment", "").lower()
-            if comment and clean_user in comment:
-                acceptance_indicators = [
-                    "также принимается", "засчитывать", "принимать", 
-                    "зачет", "зачёт", "зачитывать", "эквивалент"
-                ]
-                for indicator in acceptance_indicators:
-                    if indicator in comment:
-                        is_correct = True
-                        logging.info(f"CORRECT: Alternative answer accepted based on comment")
-                        break
-    
-    # 4. Cancel timer if it exists
+    # Send immediate acknowledgment message before we do any processing
+    ack_message = await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏳ Твой ответ принят и обрабатывается..."
+    )
+    logging.info(f"Sent acknowledgment message to user {user_id}")
+
+    # Cancel timer task IMMEDIATELY to prevent "Time's up" message
     if session.get("timer_task") and not session.get("timer_task").done():
         try:
             session["timer_task"].cancel()
             session["timer_task"] = None
             logging.info(f"Timer cancelled for user {user_id}")
         except Exception as e:
-            logging.error(f"Error cancelling timer: {e}")
+            logging.error(f"Failed to cancel timer: e")
     
-    # 5. Process result and send feedback
+    # Get the correct answer
+    correct_answer = session["q"].get("answer", "")
+    if not correct_answer:
+        logging.error(f"No correct answer found in question data for user {user_id}")
+        return
+        
+    logging.info(f"Comparing user answer '{user_answer}' with correct answer '{correct_answer}'")
+    
+    # Check if answer is correct using various methods
+    is_correct = False
+    clean_user = normalize_answer(user_answer)
+    clean_correct = normalize_answer(correct_answer)
+    
+    # Different matching strategies
+    if clean_user == clean_correct:
+        is_correct = True
+        logging.info("MATCH: Exact match after normalization")
+    elif clean_user in clean_correct or clean_correct in clean_user:
+        is_correct = True
+        logging.info("MATCH: One contains the other")
+    elif len(clean_user) > 3 and len(clean_correct) > 3 and (clean_user in clean_correct or clean_correct in clean_user):
+        is_correct = True
+        logging.info("MATCH: Partial match for longer answers")
+    
+    # Process the result
     if is_correct:
-        # Update session
+        # Mark as correctly answered and update score
         user_sessions[user_id]["answered"] = True
         user_sessions[user_id]["correct_answer"] = True
         
-        # Update score
+        # Update user score
         increment_score(user_id, name)
-        logging.info(f"Score incremented for user {user_id}")
         
-        # Prepare response
-        comment = session["q"].get("comment", "Без комментария.")
-        response = f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}"
+        # Get comment if available
+        comment = session["q"].get("comment") or "Без комментария."
         
-        # Send response
+        # Send confirmation message
+        response_text = f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}"
+        
         try:
-            await context.bot.send_message(chat_id=chat_id, text=response)
-            logging.info(f"SENT CORRECT ANSWER MESSAGE to user {user_id}")
+            # Send direct message using context.bot
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=response_text
+            )
+            logging.info(f"✅ SENT correct answer confirmation to user {user_id}")
+            
+            # Double-check if message was sent
+            if not sent:
+                logging.warning(f"Message not sent despite no exception")
+                # Try simple message as fallback
+                await context.bot.send_message(chat_id=chat_id, text="✅ Правильно!")
+                
         except Exception as e:
-            logging.error(f"Failed to send correct answer message: {e}")
-            # Try simpler message
+            logging.error(f"❌ ERROR sending correct answer confirmation: {e}")
+            # Try with a simpler message
             try:
                 await context.bot.send_message(chat_id=chat_id, text="✅ Правильно!")
-            except:
-                logging.error("Failed to send even simple correct message")
+            except Exception as e2:
+                logging.error(f"❌ ERROR sending even simple message: {e2}")
     else:
-        # Allow user to try again
+        # Allow retry for incorrect answers
         user_sessions[user_id]["answered"] = False
         
-        # Send incorrect message
         try:
-            await context.bot.send_message(chat_id=chat_id, text="❌ Неверно, попробуйте еще раз!")
-            logging.info(f"SENT INCORRECT MESSAGE to user {user_id}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Неверно, попробуйте еще раз!"
+            )
+            logging.info(f"Sent incorrect message to user {user_id}")
         except Exception as e:
-            logging.error(f"Failed to send incorrect message: {e}")
+            logging.error(f"Error sending incorrect message: {e}")
 
 def get_small_hint(answer):
     """Provides a small hint about the answer without giving too much away"""
