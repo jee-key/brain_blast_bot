@@ -264,12 +264,16 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
     user_answer = update.message.text.strip().lower()
+    logging.info(f"Processing answer from user {user_id} ({name}): '{user_answer}'")
+    
     session = user_sessions.get(user_id)
-
     if not session:
+        logging.error(f"No active session found for user {user_id}")
         await update.message.reply_text("🤔 У вас сейчас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать.")
         return
 
+    logging.info(f"Active session found for user {user_id}, answered: {session.get('answered', False)}")
+    
     if session.get("answered", False):
         await update.message.reply_text("⏳ Твой ответ уже принят, дождитесь следующего вопроса.")
         return
@@ -281,59 +285,71 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Твой ответ принят и обрабатывается...")
 
     # Process the answer
-    correct_answer = session["q"]["answer"]
-    clean_correct = normalize_answer(correct_answer)
-    clean_user = normalize_answer(user_answer)
-    logging.info(f"Normalized - User: '{clean_user}', Correct: '{clean_correct}'")
-    correct_keywords = set(clean_correct.split())
-    user_keywords = set(clean_user.split())
-    is_correct = False
+    try:
+        correct_answer = session["q"]["answer"]
+        logging.info(f"Correct answer: '{correct_answer}'")
+        
+        clean_correct = normalize_answer(correct_answer)
+        clean_user = normalize_answer(user_answer)
+        logging.info(f"Normalized - User: '{clean_user}', Correct: '{clean_correct}'")
+        
+        correct_keywords = set(clean_correct.split())
+        user_keywords = set(clean_user.split())
+        is_correct = False
 
-    if clean_user == clean_correct:
-        is_correct = True
-        logging.info("Match: Exact after normalization")
-    elif clean_user in clean_correct or clean_correct in clean_user:
-        is_correct = True
-        logging.info("Match: One contains the other")
-    elif user_answer.strip().lower() == correct_answer.strip().lower():
-        is_correct = True
-        logging.info("Match: Raw lowercased answers match")
-    elif len(correct_keywords) > 1 and len(user_keywords) > 0:
-        common_words = correct_keywords.intersection(user_keywords)
-        match_percentage = len(common_words) / len(correct_keywords)
-        logging.info(f"Keywords match: {match_percentage:.2f} ({len(common_words)}/{len(correct_keywords)})")
-        if match_percentage >= 0.7:
+        if clean_user == clean_correct:
             is_correct = True
+            logging.info("Match: Exact after normalization")
+        elif clean_user in clean_correct or clean_correct in clean_user:
+            is_correct = True
+            logging.info("Match: One contains the other")
+        elif user_answer.strip().lower() == correct_answer.strip().lower():
+            is_correct = True
+            logging.info("Match: Raw lowercased answers match")
+        elif len(correct_keywords) > 1 and len(user_keywords) > 0:
+            common_words = correct_keywords.intersection(user_keywords)
+            match_percentage = len(common_words) / len(correct_keywords)
+            logging.info(f"Keywords match: {match_percentage:.2f} ({len(common_words)}/{len(correct_keywords)})")
+            if match_percentage >= 0.7:
+                is_correct = True
 
-    if not is_correct and len(clean_correct) < 15:
-        comment = session["q"].get("comment", "").lower()
-        if comment and clean_user in comment:
-            acceptance_indicators = [
-                "также принимается", "засчитывать", "принимать", 
-                "зачет", "зачёт", "зачитывать", "эквивалент"
-            ]
-            for indicator in acceptance_indicators:
-                if indicator in comment:
-                    is_correct = True
-                    logging.info(f"Alternative answer accepted based on comment containing '{indicator}'")
-                    break
+        if not is_correct and len(clean_correct) < 15:
+            comment = session["q"].get("comment", "").lower()
+            if comment and clean_user in comment:
+                acceptance_indicators = [
+                    "также принимается", "засчитывать", "принимать", 
+                    "зачет", "зачёт", "зачитывать", "эквивалент"
+                ]
+                for indicator in acceptance_indicators:
+                    if indicator in comment:
+                        is_correct = True
+                        logging.info(f"Alternative answer accepted based on comment containing '{indicator}'")
+                        break
 
-    # Provide feedback to the user
-    if is_correct:
-        user_sessions[user_id]["correct_answer"] = True
-        increment_score(user_id, name)
-        logging.info(f"Incremented score for user {user_id} ({name})")
-        comment = session["q"].get("comment") or "Без комментария."
-        await update.message.reply_text(
-            f"✅ Правильно! Вы ответили верно.\n\n"
-            f"📝 Ответ: {session['q']['answer']}\n"
-            f"💬 {comment}"
-        )
-    else:
-        await update.message.reply_text("❌ Неверно, попробуйте еще раз!")
+        # Provide feedback to the user
+        if is_correct:
+            user_sessions[user_id]["correct_answer"] = True
+            increment_score(user_id, name)
+            logging.info(f"Incremented score for user {user_id} ({name})")
+            comment = session["q"].get("comment") or "Без комментария."
+            await update.message.reply_text(
+                f"✅ Правильно! Вы ответили верно.\n\n"
+                f"📝 Ответ: {session['q']['answer']}\n"
+                f"💬 {comment}"
+            )
+        else:
+            logging.info(f"Answer is incorrect for user {user_id}")
+            await update.message.reply_text("❌ Неверно, попробуйте еще раз!")
 
-    # Ensure no redundant "time's up" message is sent
-    session["timer_task"] = None
+        # Cancel the timer task to avoid duplicate "time's up" message
+        if session.get("timer_task") and not session.get("timer_task").done():
+            logging.info(f"Canceling timer for user {user_id}")
+            session["timer_task"].cancel()
+            session["timer_task"] = None
+            
+    except Exception as e:
+        logging.error(f"Error processing answer: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка при обработке ответа. Попробуйте еще раз или запросите новый вопрос.")
 
 def get_small_hint(answer):
     """Provides a small hint about the answer without giving too much away"""
