@@ -270,7 +270,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🤔 У вас сейчас нет активного вопроса. Нажмите 'Новый вопрос', чтобы начать.")
         return
 
-    if session.get("answered", False) or session.get("correct_answer", False):
+    if session.get("answered", False):
         await update.message.reply_text("⏳ Твой ответ уже принят, дождитесь следующего вопроса.")
         return
 
