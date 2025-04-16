@@ -552,6 +552,12 @@ def check_answer(user_answer, correct_answer):
         
     if "другие знают еще меньше" in user_clean:
         logging.info("✓ MATCH: Special case for Socrates question (variant 2)")
+        return True
+        
+    # No match found
+    return False
+
+async def start_drift(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command handler to start a new associative drift session"""
     user_id = update.message.from_user.id
     # Set user mode to drift
