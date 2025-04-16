@@ -300,7 +300,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Answer handler with improved post-timeout handling
+    Answer handler with improved post-timeout handling and answer validation
     """
     user_id = update.message.from_user.id
     name = update.message.from_user.full_name
@@ -318,26 +318,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Step 2: Check if timeout already occurred (answered=True but correct_answer not set)
-    if session.get("answered", False) and not session.get("correct_answer", False):
-        # Time's up already happened, but show the answer processing anyway
-        keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⏰ Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    # Step 3: Check if already answered correctly
-    if session.get("correct_answer", False):
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Вы уже ответили верно на этот вопрос."
-        )
-        return
-    
-    # Step 4: Send immediate acknowledgment
+    # Step 2: Send immediate acknowledgment
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -346,7 +327,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Failed to send acknowledgment: {e}")
     
-    # Step 5: Immediately cancel timer if it exists
+    # Step 3: Immediately cancel timer if it exists
     try:
         if session.get("timer_task") and not session.get("timer_task").done():
             session["timer_task"].cancel()
@@ -355,13 +336,21 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Failed to cancel timer: {e}")
     
-    # Step 6: Check answer correctness
+    # Step 4: Check if already answered correctly
+    if session.get("correct_answer", False):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Вы уже ответили верно на этот вопрос."
+        )
+        return
+    
+    # Step 5: Check answer correctness REGARDLESS of timeout
     correct_answer = session["q"].get("answer", "")
     comment = session["q"].get("comment") or "Без комментария."
     
     is_correct = check_answer(user_answer, correct_answer)
     
-    # Step 7: Process result
+    # Step 6: Process result
     if is_correct:
         # Mark as correctly answered
         user_sessions[user_id]["answered"] = True
@@ -379,22 +368,23 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"✅ Правильно! Вы ответили верно.\n\n📝 Ответ: {correct_answer}\n💬 {comment}"
         )
     else:
-        # Allow another attempt if time hasn't expired
-        if not session.get("answered", False):
+        # Check if timeout already occurred (answered=True but correct_answer not set)
+        if session.get("answered", False) and not session.get("correct_answer", False):
+            # Time's up already happened, show the answer button
+            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Неверно. Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            # Time hasn't expired yet, allow another attempt
             user_sessions[user_id]["answered"] = False
             
             # Send incorrect answer notification
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="❌ Неверно, попробуйте еще раз!"
-            )
-        else:
-            # Time already expired, offer to show answer
-            keyboard = [[InlineKeyboardButton("👀 Показать ответ", callback_data=f"reveal_answer:{user_id}")]]
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="⏰ Время уже вышло! Вы можете увидеть правильный ответ, нажав на кнопку ниже.",
-                reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
 def check_answer(user_answer, correct_answer):
