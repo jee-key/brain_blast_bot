@@ -7,7 +7,7 @@ from typing import Dict, List, Set, Optional, Tuple
 from pathlib import Path
 import csv
 import time
-from collections import LRUCache, defaultdict
+from collections import defaultdict
 
 # LRU Cache implementation for Python versions < 3.8
 # (Python 3.8+ provides functools.lru_cache with maxsize parameter)
