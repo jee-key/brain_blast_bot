@@ -121,9 +121,7 @@ async def _run_timer(chat_id, context, user_id, duration, mode, question_data):
     
     if show_hints:
         hint_times = [
-            duration * 0.25,  # First hint at 25% of time
-            duration * 0.5,   # Second hint at 50% of time
-            duration * 0.75   # Third hint at 75% of time
+            duration * 0.5
         ]
     else:
         # No hints for no_hints mode
@@ -136,9 +134,7 @@ async def _run_timer(chat_id, context, user_id, duration, mode, question_data):
     # Pre-calculate and optimize hint messages to reduce delay
     if show_hints:
         hint_messages = [
-            f"🕒 Осталось {int(duration * 0.75)} секунд\nПодсказка: {format_hint(answer, 0.25)}",
-            f"🕒 Осталось {int(duration * 0.5)} секунд\nПодсказка: {format_hint(answer, 0.5)}",
-            f"⚠️ Осталось {int(duration * 0.25)} секунд\nПодсказка: {format_hint(answer, 0.75)}"
+            f"🕒 Осталось {int(duration * 0.5)} секунд\nПодсказка: {format_hint(answer, 0.5)}"
         ]
     
     try:
