@@ -44,25 +44,24 @@ def normalize_answer(text):
 
 def format_hint(answer, revealed_percentage):
     """
-    Format a partially revealed answer hint
+    Format a hint that shows only the first letter of each word and masks the rest
     """
     if not answer:
         return "Ошибка: нет ответа для подсказки"
     
-    # Get the number of characters to reveal
-    hint_length = max(1, int(len(answer) * revealed_percentage))
+    # Split the answer into words
+    words = answer.split()
+    hint = []
     
-    # Create the hint by revealing some characters
-    hint = ""
-    for i, char in enumerate(answer):
-        if i < hint_length:
-            hint += char
-        elif char == " ":
-            hint += " "  # Keep spaces for readability
-        else:
-            hint += "•"  # Use a dot for unrevealed characters
+    # Create a hint for each word
+    for word in words:
+        if len(word) > 0:
+            # Show the first letter and mask the rest
+            masked_word = word[0] + "•" * (len(word) - 1)
+            hint.append(masked_word)
     
-    return hint
+    # Join the words back with spaces
+    return " ".join(hint)
 
 async def start_timer(chat_id, context, user_id, question_data, mode="normal"):
     """
